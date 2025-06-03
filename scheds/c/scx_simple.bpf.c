@@ -180,5 +180,5 @@ SCX_OPS_DEFINE(simple_ops,
 	       .init			= (void *)simple_init,
 	       .exit			= (void *)simple_exit,
 	       .timeout_ms		= 5000,
-	       .exit_dump_len		= 2000000,
+	       .exit_dump_len		= 3000000,
 	       .name			= "simple");
