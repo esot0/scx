@@ -9,6 +9,7 @@
 #include <signal.h>
 #include <assert.h>
 #include <libgen.h>
+#include <time.h>
 #include <bpf/bpf.h>
 #include <scx/common.h>
 #include "scx_simple.bpf.skel.h"
@@ -37,6 +38,49 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
 static void sigint_handler(int simple)
 {
 	exit_req = 1;
+}
+
+static __u64 get_current_time_ns(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (__u64)ts.tv_sec * 1000000000ULL + (__u64)ts.tv_nsec;
+}
+
+static void poll_cpus(struct scx_simple *skel)
+{
+	int nr_cpus = libbpf_num_possible_cpus();
+	assert(nr_cpus > 0);
+	__u32 idx;
+	__u64 percpu_values[nr_cpus];
+	long long difference;
+	int prev_kick_idx = 0;
+	__u64 current_time;
+	int ret;
+	
+	int map_fd = bpf_map__fd(skel->maps.prev_kick_time);
+	if (map_fd < 0) {
+		printf("Invalid map fd: %d\n", map_fd);
+		return;
+	}
+	
+	ret = bpf_map_lookup_elem(map_fd, &prev_kick_idx, percpu_values);
+	current_time = get_current_time_ns();  //Hopefully this mimics scx_bpf_now()
+	if (ret < 0) {
+		printf("Map lookup failed, ret: %d\n", ret);
+		return;
+	}
+	
+	for (idx = 0; idx < nr_cpus; idx++) {
+		difference = skel->bss->time - percpu_values[idx]; 
+		printf("CPU %d - Current time: %llu, Last kick: %llu, Difference: %lld ns\n", 
+		       idx, current_time, percpu_values[idx], difference);
+		
+		if (difference > 0 && difference >= 500000000) { // 0.5 seconds
+			printf("CPU %d is allowed to idle (idle for %lld ns = %.3f seconds)\n", 
+			       idx, difference, difference / 1000000000.0);
+		}
+	}
 }
 
 static void read_stats(struct scx_simple *skel, __u64 *stats)
@@ -91,12 +135,12 @@ restart:
 	link = SCX_OPS_ATTACH(skel, simple_ops, scx_simple);
 
 	while (!exit_req && !UEI_EXITED(skel, uei)) {
-		__u64 stats[2];
-
-		read_stats(skel, stats);
-		printf("local=%llu global=%llu\n", stats[0], stats[1]);
-		fflush(stdout);
+		poll_cpus(skel);
 		sleep(1);
+		// read_stats(skel, stats);
+		// printf("local=%llu global=%llu\n", stats[0], stats[1]);
+		// fflush(stdout);
+		// sleep(1);
 	}
 
 	bpf_link__destroy(link);
