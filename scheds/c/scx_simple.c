@@ -57,7 +57,7 @@ static void print_kick_times(struct scx_simple *skel)
 			printf("CPU %d has never been kicked or is idle\n", i);
 		}
 		else if(cnts[i] == 2){
-			printf("CPU %d is kickable.\n", i, cnts[i]);
+			printf("CPU %d is kickable.\n", i);
 		}
 		else{
 			printf("CPU %d was last kicked at %llu\n", i, cnts[i]);
