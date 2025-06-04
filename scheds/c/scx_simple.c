@@ -49,7 +49,7 @@ static __u64 get_current_time_ns(void)
 
 static void poll_cpus(struct scx_simple *skel)
 {
-	int nr_cpus = libbpf_num_possible_cpus();
+	int nr_cpus = skel->bss->num_cpus;
 	assert(nr_cpus > 0);
 	__u32 idx;
 	__u64 percpu_values[nr_cpus];
@@ -72,12 +72,14 @@ static void poll_cpus(struct scx_simple *skel)
 	}
 	
 	for (idx = 0; idx < nr_cpus; idx++) {
-		difference = skel->bss->time - percpu_values[idx]; 
-		printf("CPU %d - Current time: %llu, Last kick: %llu, Difference: %lld ns\n", 
+		difference = skel->bss->time - percpu_values[idx];
+
+		if(difference <= 500000000) { // .5 seconds 
+		printf("CPU %d is running or kicked - Current time: %llu, Last idle time: %llu, Time since last idle: %lld ns\n", 
 		       idx, current_time, percpu_values[idx], difference);
-		
-		if (difference > 0 && difference >= 500000000) { // 0.5 seconds
-			printf("CPU %d is allowed to idle (idle for %lld ns = %.3f seconds)\n", 
+		}
+		else  { 
+			printf("CPU %d is running or allowed to idle (Time since last idle: %lld ns = %.3f seconds)\n", 
 			       idx, difference, difference / 1000000000.0);
 		}
 	}

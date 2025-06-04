@@ -30,6 +30,7 @@ static u64 vtime_now;
 UEI_DEFINE(uei);
 
 volatile __u64 time = 0; //racy variable but select should be called enough times to update it somewhat accurately
+int num_cpus;
 /*
 * Built-in DSQs such as SCX_DSQ_GLOBAL cannot be used as priority queues
 * (meaning, cannot be dispatched to with scx_bpf_dsq_insert_vtime()). We
@@ -64,9 +65,9 @@ s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 {
 bool is_idle = false;
 s32 cpu;
-
-	if (time < scx_bpf_now()){
-		time = scx_bpf_now();
+u64 now = scx_bpf_now();
+	if (time < now){
+		WRITE_ONCE(time, now);
 	}
 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 if (is_idle) {
@@ -81,7 +82,7 @@ void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	u64 now = scx_bpf_now();
 	if (time < now)
-		time = now;
+		WRITE_ONCE(time, now);
 		
 stat_inc(1);	/* count global queueing */
 
@@ -104,23 +105,30 @@ enq_flags);
 
 void BPF_STRUCT_OPS(simple_dispatch, s32 cpu, struct task_struct *prev)
 {
-scx_bpf_dsq_move_to_local(SHARED_DSQ);
-
+	if(scx_bpf_dsq_move_to_local(SHARED_DSQ))
+		return;
+/*
+Don't we have to wait for the next ops.dispatch() to kick the cpu? And shouldn't we let the cpu go idle after we kick it for SCX_SLICE_DFL? I think this would continuously kick the cpu in almost every idling call to dispatch instead of running -> running an extra .5 seconds -> being allowed to idle if nothing else comes in. 
+In other words, what about the case where we run something but then want to idle for an extended period of time. 
+*/
 		
 	u32 key = 0;  // Always use key 0 for the percpu array
-	u64 now = scx_bpf_now();
-	bpf_map_update_elem(&prev_kick_time, &key, &now, BPF_ANY);
-	scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-	
+	u64 now = scx_bpf_now(), *ts = bpf_map_lookup_elem(&prev_kick_time, &key);
+	if(now - *ts < SCX_SLICE_DFL * 25) { // .5s
+		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+	}
+	else{
+		bpf_map_update_elem(&prev_kick_time, &key, &now, BPF_ANY);
+	}
 	if (time < now)
-		time = now;
+		WRITE_ONCE(time, now);
 }
 
 void BPF_STRUCT_OPS(simple_running, struct task_struct *p)
 {
 	u64 now = scx_bpf_now();
 	if (time < now)
-		time = now;
+		WRITE_ONCE(time, now);
 
 if (fifo_sched)
 return;
@@ -159,6 +167,7 @@ p->scx.dsq_vtime = vtime_now;
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(simple_init)
 {
+	num_cpus = scx_bpf_nr_cpu_ids();
 return scx_bpf_create_dsq(SHARED_DSQ, -1);
 }
 
