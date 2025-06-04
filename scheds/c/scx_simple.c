@@ -39,6 +39,33 @@ static void sigint_handler(int simple)
 	exit_req = 1;
 }
 
+static void print_kick_times(struct scx_simple *skel)
+{
+	int nr_cpus = libbpf_num_possible_cpus();
+	assert(nr_cpus > 0);
+	int key = 0;
+	__u64 cnts[nr_cpus];
+	int ret =  bpf_map_lookup_elem(bpf_map__fd(skel->maps.last_kick_time), &key, cnts);
+	
+	if(ret < 0){
+		printf("No last kick time stats found\n");
+		return;
+	}
+
+	for(int i = 0; i < nr_cpus; i++){
+		if(cnts[i] == 0 || cnts[i] == 1){
+			printf("CPU %d has never been kicked or is idle\n", i);
+		}
+		else if(cnts[i] == 2){
+			printf("CPU %d is kickable.\n", i, cnts[i]);
+		}
+		else{
+			printf("CPU %d was last kicked at %llu\n", i, cnts[i]);
+		}
+	}
+	printf("--------------------------------\n");
+}
+
 static void read_stats(struct scx_simple *skel, __u64 *stats)
 {
 	int nr_cpus = libbpf_num_possible_cpus();
@@ -93,8 +120,7 @@ restart:
 	while (!exit_req && !UEI_EXITED(skel, uei)) {
 		__u64 stats[2];
 
-		read_stats(skel, stats);
-		printf("local=%llu global=%llu\n", stats[0], stats[1]);
+		print_kick_times(skel);
 		fflush(stdout);
 		sleep(1);
 	}

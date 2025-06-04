@@ -38,6 +38,14 @@ UEI_DEFINE(uei);
  */
 #define SHARED_DSQ 0
 
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(key_size, sizeof(u32));
+	__uint(value_size, sizeof(u64));
+	__uint(max_entries, 1);			/* last time the cpu was kicked */
+} last_kick_time SEC(".maps");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(key_size, sizeof(u32));
@@ -89,7 +97,25 @@ void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
 
 void BPF_STRUCT_OPS(simple_dispatch, s32 cpu, struct task_struct *prev)
 {
-	scx_bpf_dsq_move_to_local(SHARED_DSQ);
+	u32 key = 0;
+	u64 can_idle = 1;
+	u64 kickable = 2;
+	u64 now = scx_bpf_now();
+	u64 *last_kick_time_p = bpf_map_lookup_elem(&last_kick_time, &key);
+	
+	/* Try to move tasks from shared DSQ to local DSQ */
+	if (scx_bpf_dsq_move_to_local(SHARED_DSQ) > 0) {
+		bpf_map_update_elem(&last_kick_time, &key, &kickable, BPF_ANY); //Update to 2 to signify that something's run and it's okay to kick the next time the cpu is about to idle. 
+	}
+	else if (*last_kick_time_p == kickable) {
+		/* First time going idle - kick once and record timestamp */
+		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+		bpf_map_update_elem(&last_kick_time, &key, &now, BPF_ANY);
+	} else if (*last_kick_time_p == 0 || (*last_kick_time_p != 1 && 
+		   time_before(*last_kick_time_p, now - (SCX_SLICE_DFL * 2)))) {
+		/* Two timeslices have passed since kick and idling is not currently allowed -- allow idling */
+		bpf_map_update_elem(&last_kick_time, &key, &can_idle, BPF_ANY);
+	}
 }
 
 void BPF_STRUCT_OPS(simple_running, struct task_struct *p)
