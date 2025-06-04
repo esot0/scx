@@ -29,7 +29,6 @@ const volatile bool fifo_sched;
 static u64 vtime_now;
 UEI_DEFINE(uei);
 
-volatile __u64 time = 0; //racy variable but select should be called enough times to update it somewhat accurately
 /*
  * Built-in DSQs such as SCX_DSQ_GLOBAL cannot be used as priority queues
  * (meaning, cannot be dispatched to with scx_bpf_dsq_insert_vtime()). We
@@ -38,13 +37,6 @@ volatile __u64 time = 0; //racy variable but select should be called enough time
  * use SCX_DSQ_GLOBAL.
  */
 #define SHARED_DSQ 0
-
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(key_size, sizeof(u32));
-	__uint(value_size, sizeof(__u64));
-	__uint(max_entries, 1);			/* [last time the cpu was "kicked"] */
-} prev_kick_time SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -65,9 +57,6 @@ s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 	bool is_idle = false;
 	s32 cpu;
 
-	if (time < scx_bpf_now()){
-		time = scx_bpf_now();
-	}
 	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 	if (is_idle) {
 		stat_inc(0);	/* count local queueing */
@@ -79,10 +68,6 @@ s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 
 void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	u64 now = scx_bpf_now();
-	if (time < now)
-		time = now;
-		
 	stat_inc(1);	/* count global queueing */
 
 	if (fifo_sched) {
@@ -105,23 +90,10 @@ void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
 void BPF_STRUCT_OPS(simple_dispatch, s32 cpu, struct task_struct *prev)
 {
 	scx_bpf_dsq_move_to_local(SHARED_DSQ);
-
-		
-	u32 key = 0;  // Always use key 0 for the percpu array
-	u64 now = scx_bpf_now();
-	bpf_map_update_elem(&prev_kick_time, &key, &now, BPF_ANY);
-	scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-	
-	if (time < now)
-		time = now;
 }
 
 void BPF_STRUCT_OPS(simple_running, struct task_struct *p)
 {
-	u64 now = scx_bpf_now();
-	if (time < now)
-		time = now;
-
 	if (fifo_sched)
 		return;
 
