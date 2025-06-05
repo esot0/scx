@@ -148,4 +148,5 @@ SCX_OPS_DEFINE(simple_ops,
 	       .enable			= (void *)simple_enable,
 	       .init			= (void *)simple_init,
 	       .exit			= (void *)simple_exit,
+		   .flags = SCX_OPS_ENQ_LAST ,
 	       .name			= "simple");
