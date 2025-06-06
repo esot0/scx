@@ -1,0 +1,37 @@
+sched_group: circular one way linked list? group of cpus? 
+sched_domain: a number of cpus. cpus that  you balance process load across
+sibling: additional execution unit for a cpu (smt is turned on). additionally, cores that share L2 or L3 cache?
+wakers and wakee: how can a process signal a sleeping process to wake up? Isn't that the interrupt handler's job? Or is this like a writing from/reading to a pipe situation/IPC situation?
+
+
+=== Big Picture ===
+"Global," per-NUMA node shared DSQ, as well as local, per-CPU DSQ
+Each task has a deadline: deadline = vruntime + exec_runtime
+vruntime is the task's total runtime scaled inversely by weight
+exec_vruntime is a task's average used timeslice. Frequently blocked tasks will have a smaller exec_vruntime as a resultl
+
+The task with the earliest deadline is the next one dispatched. 
+
+The scheduler picks CPUs with the following priority.
+	* Same/prev CPU if it's idling
+	* L2 cache siblings
+	* L3 cache siblings
+	* Other CPUs in the primary domain
+	* Any available CPU  
+
+It prefers SMT cores where both threads are idle, but falls back to any idle CPU if none are available.
+The scheduler monitors CPU utilization per NUMA node. When a node reaches > 50% utilization and there is at least 1 idle node in the system, enable migration. Generally tries to keep tasks within their NUMA node. Q: Why idle? Why not migrate to low load nodes if idle isn't available.
+When enqueuing tasks, try to wake idle CPUs that can run the task immediately. Furthermore, try to wake a CPU in the same cache domain.
+
+Tasks with affinity to one CPU get priority dispatch. Per-CPU kthreads may also be dispatched directly to their assigned CPUs.
+If a task finishes running before its timeslice expires, it gets the remaining time subtracted from vruntime (capped to slice_lag) the next time it's enqueued.
+
+When a waker yields the CPU, the wakee is placed on the waker's CPU. 
+
+CPUs can be throttled by being forced to idle for some time. 
+
+
+
+On task wakeup -> select_cpu() -> direct dispatch to idle cpu with cache/NUMA preference
+enqueue -> place in NUMA node DSQ / once again try to directly dispatch to idle CPU if possible
+dispatch -> take from node DSQ and place into local DSQ -> replenish timeslice and allow the task to run on the same CPU again if no other task wants to run

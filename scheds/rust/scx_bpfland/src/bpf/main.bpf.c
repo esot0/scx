@@ -136,7 +136,7 @@ const volatile bool numa_disabled = false;
 /*
  * Current global vruntime.
  */
-static u64 vtime_now;
+static u64 vtime_now; 
 
 /*
  * Timer used to update NUMA statistics.
@@ -265,7 +265,7 @@ struct task_ctx {
 	 *
 	 *   deadline = vruntime + exec_vruntime
 	 *
-	 * Here, vruntime represents the task's total runtime, scaled inversely by
+	 * Here, vruntime represents the task's total runtime, scaled inversely by 
 	 * its weight, while exec_vruntime accounts for the vruntime accumulated
 	 * from the moment the task becomes runnable until it voluntarily releases
 	 * the CPU.
@@ -489,7 +489,7 @@ static void task_update_domain(struct task_struct *p, struct task_ctx *tctx,
 }
 
 /*
- * Return true if all the CPUs in the LLC of @cpu are busy, false
+ * Return true if all the CPUs in the LLC of @cpu are busy, false Q: How are we checking the LLC here?
  * otherwise.
  */
 static bool is_llc_busy(const struct cpumask *idle_cpumask, s32 cpu)
@@ -596,7 +596,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bo
 		return -ENOENT;
 
 	/*
-	 * If prev_cpu is not in the primary domain, pick an arbitrary CPU
+	 * If prev_cpu is not in the primary domain, pick an arbitrary CPU Q: What's the primary domain?
 	 * in the primary domain.
 	 */
 	if (!bpf_cpumask_test_cpu(prev_cpu, primary)) {
@@ -607,7 +607,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bo
 	}
 
 	/*
-	 * Refresh task domain based on the previously used cpu. If we keep
+	 * Refresh task domain based on the previously used cpu. If we keep Q: What's the task's domain?
 	 * selecting the same CPU, the task's domain doesn't need to be
 	 * updated and we can save some cpumask ops.
 	 */
@@ -629,7 +629,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bo
 	 */
 	node = __COMPAT_scx_bpf_cpu_node(prev_cpu);
 	idle_smtmask = __COMPAT_scx_bpf_get_idle_smtmask_node(node);
-	idle_cpumask = __COMPAT_scx_bpf_get_idle_cpumask_node(node);
+	idle_cpumask = __COMPAT_scx_bpf_get_idle_cpumask_node(node); //Q: Why didn't we use this for pick_idle_cpu?
 
 	/*
 	 * In case of a sync wakeup, attempt to run the wakee on the
@@ -728,7 +728,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bo
 	 */
 	if (l2_mask && !node_rebalance(node)) {
 		cpu = __COMPAT_scx_bpf_pick_idle_cpu_node(l2_mask, node,
-						__COMPAT_SCX_PICK_IDLE_IN_NODE);
+						__COMPAT_SCX_PICK_IDLE_IN_NODE); //Q: How could you share just an L2 but not for instance L3?
 		if (cpu >= 0) {
 			*is_idle = true;
 			goto out_put_cpumask;
@@ -863,7 +863,7 @@ static bool kick_idle_cpu(const struct task_struct *p, const struct task_ctx *tc
 
 	/*
 	 * Look for any idle CPU usable by the task that can immediately
-	 * execute the task, prioritizing SMT isolation and cache locality.
+	 * execute the task, prioritizing SMT isolation and cache locality. Q: What's SMT isolation?
 	 */
 	mask = cast_mask(tctx->l2_cpumask);
 	if (mask) {
@@ -896,7 +896,7 @@ static bool try_direct_dispatch(struct task_struct *p, struct task_ctx *tctx,
 				s32 prev_cpu, u64 slice, u64 enq_flags)
 {
 	/*
-	 * If a task has been re-enqueued because its assigned CPU has been
+	 * If a task has been re-enqueued because its assigned CPU has been 
 	 * taken by a higher priority scheduling class, force it to follow
 	 * the regular scheduling path and give it a chance to run on a
 	 * different CPU.
@@ -922,7 +922,7 @@ static bool try_direct_dispatch(struct task_struct *p, struct task_ctx *tctx,
 		return false;
 
 	/*
-	 * If ops.select_cpu() has been skipped, try direct dispatch.
+	 * If ops.select_cpu() has been skipped, try direct dispatch. Q: Why? Isn't select_cpu where direct dispatch is done?
 	 */
 	if (!__COMPAT_is_enq_cpu_selected(enq_flags)) {
 		int node = __COMPAT_scx_bpf_cpu_node(prev_cpu);
@@ -1019,7 +1019,7 @@ void BPF_STRUCT_OPS(bpfland_enqueue, struct task_struct *p, u64 enq_flags)
 	int node = __COMPAT_scx_bpf_cpu_node(prev_cpu);
 
 	/*
-	 * Dispatch regular tasks to the shared DSQ.
+	 * Dispatch regular tasks to the shared DSQ. \
 	 */
 	tctx = try_lookup_task_ctx(p);
 	if (!tctx)
@@ -1250,7 +1250,7 @@ void BPF_STRUCT_OPS(bpfland_stopping, struct task_struct *p, bool runnable)
 
 void BPF_STRUCT_OPS(bpfland_runnable, struct task_struct *p, u64 enq_flags)
 {
-	struct task_ctx *tctx;
+	struct task_ctx *tctx; 
 
 	tctx = try_lookup_task_ctx(p);
 	if (!tctx)
@@ -1259,6 +1259,7 @@ void BPF_STRUCT_OPS(bpfland_runnable, struct task_struct *p, u64 enq_flags)
 	tctx->exec_runtime = 0;
 }
 
+//Callbacks to look into
 void BPF_STRUCT_OPS(bpfland_cpu_release, s32 cpu, struct scx_cpu_release_args *args)
 {
 	/*
@@ -1380,7 +1381,7 @@ static int init_cpumask(struct bpf_cpumask **cpumask)
 }
 
 SEC("syscall")
-int enable_sibling_cpu(struct domain_arg *input)
+int enable_sibling_cpu(struct domain_arg *input) //What's a sibling cpu? Why SEC syscall? When will this run?
 {
 	struct cpu_ctx *cctx;
 	struct bpf_cpumask *mask, **pmask;

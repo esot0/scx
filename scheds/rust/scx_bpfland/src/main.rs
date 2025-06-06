@@ -142,9 +142,11 @@ struct Opts {
     #[clap(short = 't', long, default_value = "0")]
     throttle_us: u64,
 
-    /// Set CPU idle QoS resume latency in microseconds (-1 = disabled).
+    /// Set CPU idle QoS resume latency in microseconds (-1 = disabled). Q: What is an idle QoS resume latency? 
+    /// A: This is the maximum time it should take for a CPU to wake up from idle states. Lower values keep CPUs in lighter sleep states for faster wakeup but use more power.
     ///
-    /// Setting a lower latency value makes CPUs less likely to enter deeper idle states, enhancing
+    /// Setting a lower latency value makes CPUs less likely to enter deeper idle states, enhancing Q: What's a deeper idle state? Is it a longer idle state?
+    /// A: Deeper idle states save more power by shutting down more CPU components, but take longer to wake up from.
     /// performance at the cost of higher power consumption. Alternatively, increasing the latency
     /// value may reduce performance, but also improve power efficiency.
     #[clap(short = 'I', long, allow_hyphen_values = true, default_value = "-1")]
@@ -162,7 +164,8 @@ struct Opts {
     /// This allows to prioritize per-CPU tasks that usually tend to be de-prioritized (since they
     /// can't be migrated when their only usable CPU is busy). Enabling this option can introduce
     /// unfairness and potentially trigger stalls, but it can improve performance of server-type
-    /// workloads (such as large parallel builds).
+    /// workloads (such as large parallel builds). Q: Why those workloads in particular?
+    /// A: Server workloads like parallel builds have many per-CPU kthreads doing I/O completion, interrupt handling, etc. 
     #[clap(short = 'p', long, action = clap::ArgAction::SetTrue)]
     local_pcpu: bool,
 
@@ -177,7 +180,8 @@ struct Opts {
     #[clap(short = 'k', long, action = clap::ArgAction::SetTrue)]
     local_kthreads: bool,
 
-    /// Disable direct dispatch during synchronous wakeups.
+    /// Disable direct dispatch during synchronous wakeups. Q: What is a synchronous wakeup? What exactly is a direct dispatch?
+    /// A: Synchronous wakeup means the waker immediately yields the CPU after waking a task (e.g., pipe operations). Direct dispatch bypasses the queue and immediately runs the task on a CPU.
     ///
     /// Enabling this option can lead to a more uniform load distribution across available cores,
     /// potentially improving performance in certain scenarios. However, it may come at the cost of
@@ -186,8 +190,8 @@ struct Opts {
     #[clap(short = 'w', long, action = clap::ArgAction::SetTrue)]
     no_wake_sync: bool,
 
-    /// Specifies the initial set of CPUs, represented as a bitmask in hex (e.g., 0xff), that the
-    /// scheduler will use to dispatch tasks, until the system becomes saturated, at which point
+    /// Specifies the initial set of CPUs, represented as a bitmask in hex (e.g., 0xff), that the 
+    /// scheduler will use to dispatch tasks, until the system becomes saturated, at which point /// How could this be used in numa aware scheduling?
     /// tasks may overflow to other available CPUs.
     ///
     /// Special values:
@@ -217,7 +221,8 @@ struct Opts {
 
     /// Enable CPU frequency control (only with schedutil governor).
     ///
-    /// With this option enabled the CPU frequency will be automatically scaled based on the load.
+    /// With this option enabled the CPU frequency will be automatically scaled based on the load. Q: Do you just increase the frequency for speed? And decrease to use less power? What about thermal throttling?
+    /// A: Yes, higher frequency = more speed but more power/heat. The kernel's thermal subsystem handles throttling separately - it will reduce frequency if temperature limits are exceeded, regardless of scheduler requests.
     #[clap(short = 'f', long, action = clap::ArgAction::SetTrue)]
     cpufreq: bool,
 
