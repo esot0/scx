@@ -1,14 +1,32 @@
 sched_group: circular one way linked list? group of cpus? 
 sched_domain: a number of cpus. cpus that  you balance process load across
 sibling: additional execution unit for a cpu (smt is turned on). additionally, cores that share L2 or L3 cache?
+cpu: Atomic computational unit
+core: Core is a subset of multiple cpu units
 wakers and wakee: how can a process signal a sleeping process to wake up? Isn't that the interrupt handler's job? Or is this like a writing from/reading to a pipe situation/IPC situation?
+Three cases: 
+	Interrupt wakeup: No waker, just a wakee 
+	To determine waker, look at current running proc. 
+	Synchronous wakeup: Pipe scenario. Apparently works well for some games, bad for others. 
+		SCX_WAKE_SYNC: Flag that, when set, means there's a pipe wakeup. Commits to release the CPU after wakeup. 
+	Regular wakeup: No pipes, regular wakeup with kernel thread "try_to_wakeup" (ttwu). Might also happen between userspace threads if they somehow manage to use kernel completion. Like write() and read(). 
 
+Open issue: During the wakeup, do you migrate the wakee to the waker's cpu
+
+If the pipe is used as a synchronization primitive, the working set might be on wake
 
 === Big Picture ===
-"Global," per-NUMA node shared DSQ, as well as local, per-CPU DSQ
+"Global," per-NUMA node shared DSQ, as well as local, per-CPU DSQ. Ordered by deadline. 
+
+Local, per-CPU DSQ is disabled by default because it hurts latency. All the per-CPU tasks will always win over the deadline. 
+Affinity wins over everyone else. 
+
 Each task has a deadline: deadline = vruntime + exec_runtime
-vruntime is the task's total runtime scaled inversely by weight
-exec_vruntime is a task's average used timeslice. Frequently blocked tasks will have a smaller exec_vruntime as a resultl
+vruntime is the task's total runtime scaled inversely by weight. Allows for fairness--as some point, cpu intensive tasks have smaller deadline. In terms of latency not that great. 
+If a task is sleeping for an hour, and a task runs every ms, you want to prioritize. 
+
+exec_vruntime is a task's average used timeslice. Frequently blocked tasks will have a smaller exec_vruntime as a result. If used alone, the shorter tasks would always win.
+Distinguishes long sleepers and short sleepers. 
 
 The task with the earliest deadline is the next one dispatched. 
 
@@ -17,21 +35,36 @@ The scheduler picks CPUs with the following priority.
 	* L2 cache siblings
 	* L3 cache siblings
 	* Other CPUs in the primary domain
+	* CPUs in the same NUMA node
 	* Any available CPU  
 
+Cross NUMA node migration not as expensive as running two processes on SMT cpu. 
+
 It prefers SMT cores where both threads are idle, but falls back to any idle CPU if none are available.
-The scheduler monitors CPU utilization per NUMA node. When a node reaches > 50% utilization and there is at least 1 idle node in the system, enable migration. Generally tries to keep tasks within their NUMA node. Q: Why idle? Why not migrate to low load nodes if idle isn't available.
+The scheduler monitors CPU utilization per NUMA node. When a node reaches > 50% utilization and there is at least 1 idle node in the system, enable cross-node-migration. 
 When enqueuing tasks, try to wake idle CPUs that can run the task immediately. Furthermore, try to wake a CPU in the same cache domain.
 
-Tasks with affinity to one CPU get priority dispatch. Per-CPU kthreads may also be dispatched directly to their assigned CPUs.
+(optional) Tasks with affinity to one CPU get priority dispatch. Per-CPU kthreads may also be dispatched directly to their assigned CPUs. Helps with parallel kernel builds for some reason. 
 If a task finishes running before its timeslice expires, it gets the remaining time subtracted from vruntime (capped to slice_lag) the next time it's enqueued.
 
 When a waker yields the CPU, the wakee is placed on the waker's CPU. 
 
 CPUs can be throttled by being forced to idle for some time. 
 
+Agressively try to avoid using two threads in SMT core. 
+
+Two wakeup scenarios: A task wakes another and you want to insert task into a runqueue. The waker that's holding its own runqueue lock, might need to hold remote runqueue lock. Might need to 
+(ttwuqueue): sends an interrupt to remote rq, avoids remote memory operation. Skips select_cpu in this case. Go straight to enqueue. 
+
+On task wakeup -> select_cpu() -> direct dispatch to idle cpu with cache/NUMA preference (just an optimization for locking reasons (locking in enqueue)) (called if the above scenario occurs)
+Not invoked when task can only run on single cpu for obv reasons. 
 
 
-On task wakeup -> select_cpu() -> direct dispatch to idle cpu with cache/NUMA preference
+
 enqueue -> place in NUMA node DSQ / once again try to directly dispatch to idle CPU if possible
 dispatch -> take from node DSQ and place into local DSQ -> replenish timeslice and allow the task to run on the same CPU again if no other task wants to run
+
+When doing I/O, per cpu kthreads are involved. 
+
+CPU frequency governing. If you try to use CPU more than certain %, bumps up frequency. In most cases, your software you can't do much other than select your energy profile. 
+Some machines have sched_util which lets the scheduler choose frequency. 
