@@ -24,8 +24,6 @@
 
 char _license[] SEC("license") = "GPL";
 
-const volatile bool fifo_sched;
-
 UEI_DEFINE(uei);
 
 /*
@@ -185,7 +183,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bo
 	//Look for idle cores with the same L3 cache domain (this also prioritizes another core of the same "type" (big/little) as the current core, due to the CPU topology.)
 	if (l3_mask) {
 		cpu = scx_bpf_pick_idle_cpu(l3_mask, 0);
-		bpf_printk("l3 cpu: %d\n", cpu);
+		bpf_trace_printk("l3 cpu: %d\n", sizeof("l3 cpu: %d\n"), cpu);
 		if (cpu >= 0) {
 			*is_idle = true;
 			goto out_put_cpumask;
@@ -193,7 +191,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bo
 	}
 	//Look for any idle core usable by the task
 	cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
-	bpf_printk("Any idle core: %d\n", cpu);
+	bpf_trace_printk("Any idle core: %d\n", sizeof("Any idle core: %d\n"), cpu);
 	if (cpu >= 0) {
 		*is_idle = true;
 		goto out_put_cpumask;
@@ -208,6 +206,7 @@ out_put_cpumask:
 	if (cpu < 0)
 		cpu = prev_cpu;
 
+	bpf_trace_printk("selected cpu (pick_idle_cpu): %d\n", sizeof("selected cpu (pick_idle_cpu): %d\n"), cpu);
 	return cpu;
 }
 
@@ -218,13 +217,14 @@ s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 
 	cpu = pick_idle_cpu(p, prev_cpu, wake_flags, &is_idle);
 	if (is_idle) {
-			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
 	}
 
 	//pick_idle_cpu returns -ENOENT if the task has no cpumask, so we need to return the previous cpu in that case
 	if (cpu == -ENOENT)
 		cpu = prev_cpu;
 
+	bpf_trace_printk("selected cpu (select_cpu): %d\n", sizeof("selected cpu (select_cpu): %d\n"), cpu);
 	return cpu;
 }
 
@@ -256,6 +256,11 @@ void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
 
 void BPF_STRUCT_OPS(simple_dispatch, s32 cpu, struct task_struct *prev)
 {
+	/*
+	 * Move tasks from shared DSQ to local DSQ. The function returns
+	 * when it successfully moves a task or when the shared DSQ is empty.
+	 * This allows multiple CPUs to process tasks concurrently.
+	 */
 	scx_bpf_dsq_move_to_local(SHARED_DSQ);
 }
 

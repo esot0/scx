@@ -76,7 +76,6 @@ restart:
 	while ((opt = getopt(argc, argv, "fvh")) != -1) {
 		switch (opt) {
 		case 'f':
-			skel->rodata->fifo_sched = true;
 			break;
 		case 'v':
 			verbose = true;
