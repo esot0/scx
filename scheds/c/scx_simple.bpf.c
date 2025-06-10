@@ -301,7 +301,7 @@ s32 BPF_STRUCT_OPS(simple_init_task, struct task_struct *p,
 	if (!tctx)
 		return -ENOMEM;
 	/*
-	 * Create task's L3 cache cpumask.
+	 * Create task's L3 cache cpumask. TODO: Syscall to actually set the cpumask.
 	 */
 	cpumask = bpf_cpumask_create();
 	if (!cpumask)
