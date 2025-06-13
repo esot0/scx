@@ -24,9 +24,11 @@ enum consts {
 	CLOCK_BOOTTIME		= 7,
 
 	/* DSQ modes */
-	DSQ_MODE_NODE = 0,
 	DSQ_MODE_CPU = 1,
 	DSQ_MODE_SHARED = 2,
+
+	/* Maximum number of GPU task PIDs to track */
+	MAX_GPU_TASK_PIDS = 10000,
 };
 
 #ifndef __VMLINUX_H__
