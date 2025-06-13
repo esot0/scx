@@ -105,6 +105,10 @@ pub fn get_default_config() -> Config {
                 "scx_rustland".to_string(),
                 get_default_sched_for_config(&SupportedSched::Rustland),
             ),
+            (
+                "scx_spark".to_string(),
+                get_default_sched_for_config(&SupportedSched::Spark),
+            ),
         ]),
     }
 }
@@ -222,6 +226,8 @@ fn get_default_scx_flags_for_mode(scx_sched: &SupportedSched, sched_mode: SchedM
         },
         // scx_rustland doesn't support any of these modes
         SupportedSched::Rustland => vec![],
+        // scx_spark doesn't support any of these modes
+        SupportedSched::Spark => vec![],
     }
 }
 
