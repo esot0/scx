@@ -534,7 +534,7 @@ impl<'a> Scheduler<'a> {
         lvl: usize,
         cpu: usize,
         sibling_cpu: usize,
-    ) -> Result<(), u32> {
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let prog = &mut skel.progs.enable_sibling_cpu;
         let mut args = domain_arg {
             lvl_id: lvl as c_int,
@@ -550,19 +550,19 @@ impl<'a> Scheduler<'a> {
             }),
             ..Default::default()
         };
-        let out = prog.test_run(input).unwrap();
+        let out = prog.test_run(input)?;
         if out.return_value != 0 {
-            return Err(out.return_value);
+            return Err(format!("BPF function returned error: {}", out.return_value).into());
         }
 
         Ok(())
     }
-    
+
     fn init_cache_domains(
         skel: &mut BpfSkel<'_>,
         topo: &Topology,
         cache_lvl: usize,
-        enable_sibling_cpu_fn: &dyn Fn(&mut BpfSkel<'_>, usize, usize, usize) -> Result<(), u32>,
+        enable_sibling_cpu_fn: &dyn Fn(&mut BpfSkel<'_>, usize, usize, usize) -> Result<(), Box<dyn std::error::Error>>,
     ) -> Result<(), std::io::Error> {
         // Determine the list of CPU IDs associated to each cache node.
         let mut cache_id_map: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -589,10 +589,10 @@ impl<'a> Scheduler<'a> {
             );
             for cpu in &cpus {
                 for sibling_cpu in &cpus {
-                    if enable_sibling_cpu_fn(skel, cache_lvl, *cpu, *sibling_cpu).is_err() {
+                    if let Err(err) = enable_sibling_cpu_fn(skel, cache_lvl, *cpu, *sibling_cpu) {
                         warn!(
-                            "L{} cache ID {}: failed to set CPU {} sibling {}",
-                            cache_lvl, cache_id, *cpu, *sibling_cpu
+                            "L{} cache ID {}: failed to set CPU {} sibling {}: {}",
+                            cache_lvl, cache_id, *cpu, *sibling_cpu, err
                         );
                     }
                 }
@@ -621,6 +621,7 @@ impl<'a> Scheduler<'a> {
             nr_gpu_task_dispatches: self.skel.maps.bss_data.nr_gpu_task_dispatches,
         }
     }
+
 
     pub fn exited(&mut self) -> bool {
         uei_exited!(&self.skel, uei)
