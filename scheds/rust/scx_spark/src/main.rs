@@ -11,7 +11,6 @@ pub mod bpf_intf;
 pub use bpf_intf::*;
 
 // DSQ mode constants
-const DSQ_MODE_NODE: u32 = 0;
 const DSQ_MODE_CPU: u32 = 1;
 const DSQ_MODE_SHARED: u32 = 2;
 
@@ -204,26 +203,13 @@ struct Opts {
     #[clap(short = 'm', long, default_value = "auto")]
     primary_domain: String,
 
-    /// Disable L2 cache awareness.
-    #[clap(long, action = clap::ArgAction::SetTrue)]
-    disable_l2: bool,
-
     /// Disable L3 cache awareness.
     #[clap(long, action = clap::ArgAction::SetTrue)]
     disable_l3: bool,
 
-    /// Disable SMT awareness.
-    #[clap(long, action = clap::ArgAction::SetTrue)]
-    disable_smt: bool,
-
-    /// Disable NUMA rebalancing.
-    #[clap(long, action = clap::ArgAction::SetTrue)]
-    disable_numa: bool,
-
     /// DSQ dispatch mode.
     ///
     /// This option determines how dispatch queues (DSQs) are organized:
-    ///  - "node" = per-NUMA-node DSQs (best for NUMA-aware load balancing)
     ///  - "cpu" = per-CPU DSQs (best for CPU affinity and cache locality)
     ///  - "shared" = single shared DSQ for all CPUs (default, simplest, good for uniform workloads)
     #[clap(long, default_value = "shared")]
@@ -255,6 +241,22 @@ struct Opts {
     #[clap(short = 'd', long, action = clap::ArgAction::SetTrue)]
     debug: bool,
 
+
+    /// Enable GPU support for task detection and prioritization.
+    ///
+    /// When enabled, tasks that use GPU operations (detected via kprobes on NVIDIA driver
+    /// functions) will be prioritized on fast cores to improve GPU-CPU coordination.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    enable_gpu_support: bool,
+
+    /// Aggressive GPU task mode: only GPU tasks can use big/performance cores.
+    ///
+    /// When enabled with --enable-gpu-support, non-GPU tasks will be restricted to
+    /// non-primary domain CPUs (little cores in big.LITTLE systems), ensuring that
+    /// only GPU tasks can utilize the fastest cores for maximum GPU-CPU coordination.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    aggressive_gpu_tasks: bool,
+
     /// Enable verbose output, including libbpf details.
     #[clap(short = 'v', long, action = clap::ArgAction::SetTrue)]
     verbose: bool,
@@ -284,26 +286,21 @@ impl<'a> Scheduler<'a> {
 
         // Validate command line arguments.
         assert!(opts.slice_us >= opts.slice_us_min);
-        assert!(matches!(opts.dsq_mode.as_str(), "node" | "cpu" | "shared"),
-                "Invalid DSQ mode: '{}'. Valid options: node, cpu, shared", opts.dsq_mode);
+        assert!(matches!(opts.dsq_mode.as_str(), "cpu" | "shared"),
+                "Invalid DSQ mode: '{}'. Valid options: cpu, shared", opts.dsq_mode);
 
         // Initialize CPU topology.
         let topo = Topology::new().unwrap();
 
-        // Check host topology to determine if we need to enable SMT capabilities.
-        let smt_enabled = !opts.disable_smt && topo.smt_enabled;
-
         let dsq_mode_str = match opts.dsq_mode.as_str() {
             "cpu" => "per-CPU DSQs",
-            "node" => "per-node DSQs",
             "shared" | _ => "shared DSQ",
         };
 
         info!(
-            "{} {} {} ({})",
+            "{} {} ({})",
             SCHEDULER_NAME,
             build_id::full_version(env!("CARGO_PKG_VERSION")),
-            if smt_enabled { "SMT on" } else { "SMT off" },
             dsq_mode_str
         );
 
@@ -330,8 +327,6 @@ impl<'a> Scheduler<'a> {
 
         // Override default BPF scheduling parameters.
         skel.maps.rodata_data.debug = opts.debug;
-        skel.maps.rodata_data.smt_enabled = smt_enabled;
-        skel.maps.rodata_data.numa_disabled = opts.disable_numa;
         skel.maps.rodata_data.local_pcpu = opts.local_pcpu;
         skel.maps.rodata_data.no_preempt = opts.no_preempt;
         skel.maps.rodata_data.no_wake_sync = opts.no_wake_sync;
@@ -341,22 +336,31 @@ impl<'a> Scheduler<'a> {
         skel.maps.rodata_data.throttle_ns = opts.throttle_us * 1000;
         skel.maps.rodata_data.dsq_mode = match opts.dsq_mode.as_str() {
             "cpu" => DSQ_MODE_CPU,
-            "node" => DSQ_MODE_NODE,
             "shared" | _ => DSQ_MODE_SHARED,
         };
+
+        // Enable GPU support if requested.
+        skel.maps.rodata_data.enable_gpu_support = opts.enable_gpu_support;
+
+        if opts.enable_gpu_support {
+            info!("GPU support enabled.");
+        }
+
+        // Enable aggressive GPU tasks mode if requested.
+        skel.maps.rodata_data.aggressive_gpu_tasks = opts.aggressive_gpu_tasks;
+
+        if opts.aggressive_gpu_tasks && opts.enable_gpu_support {
+            info!("Aggressive GPU mode enabled - only GPU tasks can use big/performance cores");
+        }
 
         // Implicitly enable direct dispatch of per-CPU kthreads if CPU throttling is enabled
         // (it's never a good idea to throttle per-CPU kthreads).
         skel.maps.rodata_data.local_kthreads = opts.local_kthreads || opts.throttle_us > 0;
 
-        // Set scheduler compatibility flags.
-        skel.maps.rodata_data.__COMPAT_SCX_PICK_IDLE_IN_NODE = *compat::SCX_PICK_IDLE_IN_NODE;
-
         // Set scheduler flags.
         skel.struct_ops.bpfland_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
             | *compat::SCX_OPS_ENQ_LAST
             | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED
-            | *compat::SCX_OPS_BUILTIN_IDLE_PER_NODE
             | *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP;
         info!(
             "scheduler flags: {:#x}",
@@ -378,15 +382,6 @@ impl<'a> Scheduler<'a> {
             );
         }
 
-        // Initialize SMT domains.
-        if smt_enabled {
-            Self::init_smt_domains(&mut skel, &topo)?;
-        }
-
-        // Initialize L2 cache domains.
-        if !opts.disable_l2 {
-            Self::init_l2_cache_domains(&mut skel, &topo)?;
-        }
         // Initialize L3 cache domains.
         if !opts.disable_l3 {
             Self::init_l3_cache_domains(&mut skel, &topo)?;
@@ -562,34 +557,7 @@ impl<'a> Scheduler<'a> {
 
         Ok(())
     }
-
-    fn init_smt_domains(skel: &mut BpfSkel<'_>, topo: &Topology) -> Result<(), std::io::Error> {
-        let smt_siblings = topo.sibling_cpus();
-
-        info!("SMT sibling CPUs: {:?}", smt_siblings);
-        for (cpu, sibling_cpu) in smt_siblings.iter().enumerate() {
-            Self::enable_sibling_cpu(skel, 0, cpu, *sibling_cpu as usize).unwrap();
-        }
-
-        Ok(())
-    }
-
-    fn are_smt_siblings(topo: &Topology, cpus: &[usize]) -> bool {
-        // Single CPU or empty array are considered siblings.
-        if cpus.len() <= 1 {
-            return true;
-        }
-
-        // Check if each CPU is a sibling of the first CPU.
-        let first_cpu = cpus[0];
-        let smt_siblings = topo.sibling_cpus();
-        cpus.iter().all(|&cpu| {
-            cpu == first_cpu
-                || smt_siblings[cpu] == first_cpu as i32
-                || (smt_siblings[first_cpu] >= 0 && smt_siblings[first_cpu] == cpu as i32)
-        })
-    }
-
+    
     fn init_cache_domains(
         skel: &mut BpfSkel<'_>,
         topo: &Topology,
@@ -601,7 +569,6 @@ impl<'a> Scheduler<'a> {
         for core in topo.all_cores.values() {
             for (cpu_id, cpu) in &core.cpus {
                 let cache_id = match cache_lvl {
-                    2 => cpu.l2_id,
                     3 => cpu.llc_id,
                     _ => panic!("invalid cache level {}", cache_lvl),
                 };
@@ -613,11 +580,6 @@ impl<'a> Scheduler<'a> {
         for (cache_id, cpus) in cache_id_map {
             // Ignore the cache domain if it includes a single CPU.
             if cpus.len() <= 1 {
-                continue;
-            }
-
-            // Ignore the cache domain if all the CPUs are part of the same SMT core.
-            if Self::are_smt_siblings(topo, &cpus) {
                 continue;
             }
 
@@ -640,15 +602,6 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    fn init_l2_cache_domains(
-        skel: &mut BpfSkel<'_>,
-        topo: &Topology,
-    ) -> Result<(), std::io::Error> {
-        Self::init_cache_domains(skel, topo, 2, &|skel, lvl, cpu, sibling_cpu| {
-            Self::enable_sibling_cpu(skel, lvl, cpu, sibling_cpu)
-        })
-    }
-
     fn init_l3_cache_domains(
         skel: &mut BpfSkel<'_>,
         topo: &Topology,
@@ -665,6 +618,7 @@ impl<'a> Scheduler<'a> {
             nr_kthread_dispatches: self.skel.maps.bss_data.nr_kthread_dispatches,
             nr_direct_dispatches: self.skel.maps.bss_data.nr_direct_dispatches,
             nr_shared_dispatches: self.skel.maps.bss_data.nr_shared_dispatches,
+            nr_gpu_task_dispatches: self.skel.maps.bss_data.nr_gpu_task_dispatches,
         }
     }
 

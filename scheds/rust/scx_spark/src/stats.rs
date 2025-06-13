@@ -25,19 +25,22 @@ pub struct Metrics {
     pub nr_direct_dispatches: u64,
     #[stat(desc = "Number of regular task dispatches")]
     pub nr_shared_dispatches: u64,
+    #[stat(desc = "Number of GPU-using task dispatches")]
+    pub nr_gpu_task_dispatches: u64,
 }
 
 impl Metrics {
     fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[{}] tasks -> r: {:>2}/{:<2} | dispatch -> k: {:<5} d: {:<5} s: {:<5}",
+            "[{}] tasks -> r: {:>2}/{:<2} | dispatch -> k: {:<5} d: {:<5} s: {:<5} g: {:<5}",
             crate::SCHEDULER_NAME,
             self.nr_running,
             self.nr_cpus,
             self.nr_kthread_dispatches,
             self.nr_direct_dispatches,
-            self.nr_shared_dispatches
+            self.nr_shared_dispatches,
+            self.nr_gpu_task_dispatches
         )?;
         Ok(())
     }
@@ -47,6 +50,7 @@ impl Metrics {
             nr_kthread_dispatches: self.nr_kthread_dispatches - rhs.nr_kthread_dispatches,
             nr_direct_dispatches: self.nr_direct_dispatches - rhs.nr_direct_dispatches,
             nr_shared_dispatches: self.nr_shared_dispatches - rhs.nr_shared_dispatches,
+            nr_gpu_task_dispatches: self.nr_gpu_task_dispatches - rhs.nr_gpu_task_dispatches,
             ..self.clone()
         }
     }
