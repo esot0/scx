@@ -520,7 +520,12 @@ static bool is_llc_busy(const struct cpumask *idle_cpumask, s32 cpu)
 	if (!l3_mask)
 		l3_mask = primary;
 
-	return !bpf_cpumask_intersects(l3_mask, idle_cpumask);
+	/* If we still don't have a valid mask, assume not busy */
+	if (!l3_mask)
+		return false;
+
+return false;
+	//return !bpf_cpumask_intersects(l3_mask, idle_cpumask);
 }
 
 /*
@@ -592,7 +597,7 @@ static s32 find_idle_cpu_in_mask(const struct cpumask *mask, u64 flags)
 
 static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bool *is_idle)
 {
-	const struct cpumask *primary, *p_mask, *l3_mask;
+	const struct cpumask *primary, *p_mask, *l3_mask, *idle_cpumask;
 	struct task_ctx *tctx;
 	s32 this_cpu = bpf_get_smp_processor_id(), cpu;
 	bool share_llc;
@@ -635,6 +640,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bo
 	if (l3_mask && bpf_cpumask_empty(l3_mask))
 		l3_mask = NULL;
 
+	idle_cpumask = scx_bpf_get_idle_cpumask();
 	/*
 	 * In case of a sync wakeup, attempt to run the wakee on the
 	 * waker's CPU if possible, as it's going to release the CPU right
@@ -647,11 +653,11 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bo
 	 */
 	share_llc = l3_mask && bpf_cpumask_test_cpu(this_cpu, l3_mask);
 	if (is_wake_sync(prev_cpu, this_cpu, wake_flags) &&
-	    share_llc && !is_llc_busy(NULL, this_cpu)) {
+	    share_llc && !is_llc_busy(idle_cpumask, this_cpu)) {
 		cpu = try_sync_wakeup(p, prev_cpu, this_cpu);
 		if (cpu >= 0) {
 			*is_idle = true;
-			return cpu;
+			goto out_put_cpumask;
 		}
 	}
 
@@ -661,7 +667,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bo
 	if (scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
 		cpu = prev_cpu;
 		*is_idle = true;
-		return cpu;
+		goto out_put_cpumask;
 	}
 
 	/*
@@ -671,7 +677,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bo
 		cpu = find_idle_cpu_in_mask(l3_mask, 0);
 		if (cpu >= 0) {
 			*is_idle = true;
-			return cpu;
+			goto out_put_cpumask;
 		}
 	}
 
@@ -682,7 +688,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bo
 		cpu = find_idle_cpu_in_mask(p_mask, 0);
 		if (cpu >= 0) {
 			*is_idle = true;
-			return cpu;
+			goto out_put_cpumask;
 		}
 	}
 
@@ -692,9 +698,11 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bo
 	cpu = find_idle_cpu_in_mask(p->cpus_ptr, 0);
 	if (cpu >= 0) {
 		*is_idle = true;
-		return cpu;
+		goto out_put_cpumask;
 	}
 
+out_put_cpumask:
+	scx_bpf_put_cpumask(idle_cpumask);
 	/*
 	 * If we couldn't find any CPU, or in case of error, return the
 	 * previously used CPU.
@@ -932,35 +940,6 @@ void BPF_STRUCT_OPS(bpfland_enqueue, struct task_struct *p, u64 enq_flags)
 		kick_idle_cpu(p, tctx, prev_cpu);
 }
 
-/*
- * Return true if the task can keep running on its current CPU, false if
- * the task should migrate.
- */
-static bool keep_running(const struct task_struct *p, s32 cpu)
-{
-	const struct cpumask *primary = cast_mask(primary_cpumask);
-	struct cpu_ctx *cctx;
-
-	/* Do not keep running if the task doesn't need to run */
-	if (!is_queued(p))
-		return false;
-
-	/* Do not keep running if the CPU is not in the primary domain */
-	if (!primary || !bpf_cpumask_test_cpu(cpu, primary))
-		return false;
-
-	/*
-	 * If the task can only run on this CPU, keep it running.
-	 */
-	if (p->nr_cpus_allowed == 1)
-		return true;
-
-	cctx = try_lookup_cpu_ctx(cpu);
-	if (!cctx)
-		return false;
-
-	return true;
-}
 
 void BPF_STRUCT_OPS(bpfland_dispatch, s32 cpu, struct task_struct *prev)
 {
