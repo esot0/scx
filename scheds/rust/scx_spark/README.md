@@ -30,35 +30,15 @@ In aggressive mode:
 
 ## Example Usage
 
-### Basic GPU-optimized scheduling
-```bash
-sudo scx_spark --enable-gpu-support --primary-domain performance
-```
-
-### Aggressive GPU mode for maximum performance
-```bash
-sudo scx_spark --enable-gpu-support --aggressive-gpu-tasks --primary-domain performance
-```
 
 ### High-performance AI workload
 ```bash
 sudo scx_spark \
   --enable-gpu-support \
   --aggressive-gpu-tasks \
-  --primary-domain performance \
   --dsq-mode cpu \
-  --slice-us 10000 \
-  --stats 0.5
 ```
 
-### Power-efficient GPU scheduling
-```bash
-sudo scx_spark \
-  --enable-gpu-support \
-  --primary-domain auto \
-  --cpufreq \
-  --throttle-us 1000
-```
 ## Command Line Options
 
 ### GPU Support

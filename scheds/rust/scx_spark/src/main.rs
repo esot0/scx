@@ -14,6 +14,11 @@ pub use bpf_intf::*;
 const DSQ_MODE_CPU: u32 = 1;
 const DSQ_MODE_SHARED: u32 = 2;
 
+// CPU mask type constants
+const MASK_TYPE_PRIMARY: i32 = 0;
+const MASK_TYPE_BIG: i32 = 1;
+const MASK_TYPE_LITTLE: i32 = 2;
+
 mod stats;
 use std::collections::BTreeMap;
 use std::ffi::c_int;
@@ -72,6 +77,38 @@ fn get_primary_cpus(mode: Powermode) -> std::io::Result<Vec<usize>> {
             // Powersave mode: add all the Little CPUs
             (Powermode::Powersave, CoreType::Little) => Some(*cpu_id),
             (Powermode::Any, ..) => Some(*cpu_id),
+            _ => None,
+        })
+        .collect();
+
+    Ok(cpus)
+}
+
+fn get_big_cpus() -> std::io::Result<Vec<usize>> {
+    let topo = Topology::new().unwrap();
+
+    let cpus: Vec<usize> = topo
+        .all_cores
+        .values()
+        .flat_map(|core| &core.cpus)
+        .filter_map(|(cpu_id, cpu)| match &cpu.core_type {
+            CoreType::Big { .. } => Some(*cpu_id),
+            _ => None,
+        })
+        .collect();
+
+    Ok(cpus)
+}
+
+fn get_little_cpus() -> std::io::Result<Vec<usize>> {
+    let topo = Topology::new().unwrap();
+
+    let cpus: Vec<usize> = topo
+        .all_cores
+        .values()
+        .flat_map(|core| &core.cpus)
+        .filter_map(|(cpu_id, cpu)| match &cpu.core_type {
+            CoreType::Little => Some(*cpu_id),
             _ => None,
         })
         .collect();
@@ -387,6 +424,14 @@ impl<'a> Scheduler<'a> {
             Self::init_l3_cache_domains(&mut skel, &topo)?;
         }
 
+        // Initialize big and little CPU domains.
+        if let Err(err) = Self::init_big_cpu_domain(&mut skel) {
+            warn!("failed to initialize big CPU domain: error {}", err);
+        }
+        if let Err(err) = Self::init_little_cpu_domain(&mut skel) {
+            warn!("failed to initialize little CPU domain: error {}", err);
+        }
+
         // Attach the scheduler.
         let struct_ops = Some(scx_ops_attach!(skel, bpfland_ops)?);
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
@@ -402,10 +447,11 @@ impl<'a> Scheduler<'a> {
         })
     }
 
-    fn enable_primary_cpu(skel: &mut BpfSkel<'_>, cpu: i32) -> Result<(), u32> {
-        let prog = &mut skel.progs.enable_primary_cpu;
-        let mut args = cpu_arg {
+    fn enable_cpu(skel: &mut BpfSkel<'_>, cpu: i32, mask_type: i32) -> Result<(), u32> {
+        let prog = &mut skel.progs.enable_cpu;
+        let mut args = enable_cpu_arg {
             cpu_id: cpu as c_int,
+            mask_type: mask_type as c_int,
         };
         let input = ProgramInput {
             context_in: Some(unsafe {
@@ -456,15 +502,65 @@ impl<'a> Scheduler<'a> {
         info!("primary CPU domain = 0x{:x}", domain);
 
         // Clear the primary domain by passing a negative CPU id.
-        if let Err(err) = Self::enable_primary_cpu(skel, -1) {
+        if let Err(err) = Self::enable_cpu(skel, -1, MASK_TYPE_PRIMARY) {
             warn!("failed to reset primary domain: error {}", err);
         }
         // Update primary scheduling domain.
         for cpu in 0..*NR_CPU_IDS {
             if domain.test_cpu(cpu) {
-                if let Err(err) = Self::enable_primary_cpu(skel, cpu as i32) {
+                if let Err(err) = Self::enable_cpu(skel, cpu as i32, MASK_TYPE_PRIMARY) {
                     warn!("failed to add CPU {} to primary domain: error {}", cpu, err);
                 }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn init_big_cpu_domain(skel: &mut BpfSkel<'_>) -> Result<()> {
+        let big_cpus = get_big_cpus()?;
+        
+        if big_cpus.is_empty() {
+            info!("No big cores detected in the system");
+            return Ok(());
+        }
+
+        info!("Big cores detected: {:?}", big_cpus);
+
+        // Clear the big domain by passing a negative CPU id.
+        if let Err(err) = Self::enable_cpu(skel, -1, MASK_TYPE_BIG) {
+            warn!("failed to reset big domain: error {}", err);
+        }
+        
+        // Update big CPU domain.
+        for cpu in big_cpus {
+            if let Err(err) = Self::enable_cpu(skel, cpu as i32, MASK_TYPE_BIG) {
+                warn!("failed to add CPU {} to big domain: error {}", cpu, err);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn init_little_cpu_domain(skel: &mut BpfSkel<'_>) -> Result<()> {
+        let little_cpus = get_little_cpus()?;
+        
+        if little_cpus.is_empty() {
+            info!("No little cores detected in the system");
+            return Ok(());
+        }
+
+        info!("Little cores detected: {:?}", little_cpus);
+
+        // Clear the little domain by passing a negative CPU id.
+        if let Err(err) = Self::enable_cpu(skel, -1, MASK_TYPE_LITTLE) {
+            warn!("failed to reset little domain: error {}", err);
+        }
+        
+        // Update little CPU domain.
+        for cpu in little_cpus {
+            if let Err(err) = Self::enable_cpu(skel, cpu as i32, MASK_TYPE_LITTLE) {
+                warn!("failed to add CPU {} to little domain: error {}", cpu, err);
             }
         }
 
