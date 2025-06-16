@@ -105,7 +105,7 @@ volatile u64 nr_online_cpus;
 /*
  * Maximum possible CPU number.
  */
-static u64 nr_cpu_ids;
+static u64 nr_cpu_ids = 1;
 
 /*
  * Runtime throttling.
@@ -155,6 +155,15 @@ struct {
  */
 private(BPFLAND) struct bpf_cpumask __kptr *primary_cpumask;
 
+/*
+ * Mask of Big (performance) CPUs.
+ */
+private(BPFLAND) struct bpf_cpumask __kptr *big_cpumask;
+
+/*
+ * Mask of Little (energy-efficient) CPUs.
+ */
+private(BPFLAND) struct bpf_cpumask __kptr *little_cpumask;
 
 /*
  * DSQ dispatch mode.
@@ -302,18 +311,21 @@ struct task_ctx {
 /*
  * GPU detection kprobes.
  */
-SEC("?kprobe/nvidia_poll")
+SEC("kprobe/nvidia_poll")
 int kprobe_nvidia_poll() {
+	bpf_trace_printk("nvidia_poll detected, saving pid/tid\n", sizeof("nvidia_poll detected, saving pid/tid\n"));
 	return save_gpu_tgid_pid();
 }
 
-SEC("?kprobe/nvidia_open")
+SEC("kprobe/nvidia_open")
 int kprobe_nvidia_open() {
+	bpf_trace_printk("nvidia_open detected, saving pid/tid\n", sizeof("nvidia_open detected, saving pid/tid\n"));
 	return save_gpu_tgid_pid();
 }
 
-SEC("?kprobe/nvidia_mmap")
+SEC("kprobe/nvidia_mmap")
 int kprobe_nvidia_mmap() {
+	bpf_trace_printk("nvidia_mmap detected, saving pid/tid\n", sizeof("nvidia_mmap detected, saving pid/tid\n"));
 	return save_gpu_tgid_pid();
 }
 
@@ -375,7 +387,7 @@ static u64 get_dsq_id(s32 cpu)
 {
 	switch (dsq_mode) {
 	case DSQ_MODE_CPU:
-		return SCX_DSQ_GLOBAL + 1 + cpu;
+		return (u64) cpu;
 	case DSQ_MODE_SHARED:
 	default:
 		return SHARED_DSQ_ID;
@@ -448,6 +460,36 @@ static u64 task_deadline(const struct task_struct *p, struct task_ctx *tctx)
 
 	return tctx->deadline;
 }
+
+/*
+ * Return true if the task can keep running on its current CPU, false if
+ * the task should migrate.
+ */
+static bool keep_running(const struct task_struct *p, s32 cpu)
+{
+	int node = __COMPAT_scx_bpf_cpu_node(cpu);
+	const struct cpumask  *idle_cpumask;
+	struct cpu_ctx *cctx;
+	bool ret;
+
+	/* Do not keep running if the task doesn't need to run */
+	if (!is_queued(p))
+		return false;
+
+
+	/*
+	 * If the task can only run on this CPU, keep it running.
+	 */
+	if (p->nr_cpus_allowed == 1)
+		return true;
+
+	cctx = try_lookup_cpu_ctx(cpu);
+	if (!cctx)
+		return false;
+
+	return true;
+}
+
 
 static void task_update_domain(struct task_struct *p, struct task_ctx *tctx,
 			       s32 cpu, const struct cpumask *cpumask)
@@ -524,8 +566,7 @@ static bool is_llc_busy(const struct cpumask *idle_cpumask, s32 cpu)
 	if (!l3_mask)
 		return false;
 
-return false;
-	//return !bpf_cpumask_intersects(l3_mask, idle_cpumask);
+	return !bpf_cpumask_intersects(l3_mask, idle_cpumask);
 }
 
 /*
@@ -595,36 +636,100 @@ static s32 find_idle_cpu_in_mask(const struct cpumask *mask, u64 flags)
 	return scx_bpf_pick_idle_cpu(mask, flags);
 }
 
+static s32 pick_idle_cpu_gpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bool *is_idle)
+{
+	const struct cpumask *big_mask;
+	s32 cpu = -1;
+
+	big_mask = cast_mask(big_cpumask);
+	if (big_mask && bpf_cpumask_empty(big_mask)){
+		big_mask = NULL;
+		return prev_cpu;
+	}
+
+			/*
+	 * Try to re-use the same CPU if it's a big CPU.
+	 */
+	if (big_mask && bpf_cpumask_test_cpu(prev_cpu, big_mask) && scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+		*is_idle = true;
+		return prev_cpu;
+	}
+
+	//All big CPUs are L3 cache siblings
+	if (big_mask) {
+		cpu = find_idle_cpu_in_mask(big_mask, 0);
+		if(cpu >= 0){
+			*is_idle = true;
+		}
+	}
+
+	return cpu >= 0 ? cpu : prev_cpu;
+}
+
 static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bool *is_idle)
 {
-	const struct cpumask *primary, *p_mask, *l3_mask, *idle_cpumask;
+	const struct cpumask *primary, *p_mask, *l3_mask, *idle_cpumask, *little_mask;
 	struct task_ctx *tctx;
 	s32 this_cpu = bpf_get_smp_processor_id(), cpu;
 	bool share_llc;
 	bool is_gpu_task = false;
 
-	primary = cast_mask(primary_cpumask);
-	if (!primary)
-		return -EINVAL;
-
 	tctx = try_lookup_task_ctx(p);
 	if (!tctx)
 		return -ENOENT;
 
-	/* Check if this is a GPU task */
 	is_gpu_task = tctx->is_gpu_task;
+
+	if(aggressive_gpu_tasks){
+		if(is_gpu_task){
+			cpu = pick_idle_cpu_gpu(p, prev_cpu, wake_flags, is_idle);
+			if(cpu >= 0){
+				return cpu;
+			}
+		}
+		else{
+			little_mask = cast_mask(little_cpumask);
+			if (little_mask && bpf_cpumask_empty(little_mask)){
+				little_mask = NULL;
+			}
+
+			/*
+	 * Try to re-use the same CPU if it's a little CPU.
+	 */
+	if (little_mask && bpf_cpumask_test_cpu(prev_cpu, little_mask)) {
+		cpu = prev_cpu;
+		*is_idle = true;
+		goto out_put_cpumask;
+	}
+
+			//All little CPUs are L3 cache siblings
+			if(little_mask){
+				cpu = find_idle_cpu_in_mask(little_mask, 0);
+				if(cpu >= 0){
+					*is_idle = true;
+					goto out_put_cpumask;
+				}
+			}
+		}
+	}
+	 
+
+	primary = cast_mask(primary_cpumask);
+	if (!primary)
+		return -EINVAL;
+
 
 	/*
 	 * If prev_cpu is not in the primary domain, pick an arbitrary CPU
 	 * in the primary domain.
 	 */
-	if (!bpf_cpumask_test_cpu(prev_cpu, primary)) {
-		cpu = bpf_cpumask_any_and_distribute(p->cpus_ptr, primary);
-		if (cpu >= nr_cpu_ids)
-			return prev_cpu;
-		prev_cpu = cpu;
-	}
 
+	  	if (!bpf_cpumask_test_cpu(prev_cpu, primary)) {
+	  	cpu = bpf_cpumask_any_and_distribute(p->cpus_ptr, primary);
+	  	if (cpu >= nr_cpu_ids)
+	  		return prev_cpu;
+	  	prev_cpu = cpu;
+	}
 	/*
 	 * Refresh task domain based on the previously used cpu. If we keep
 	 * selecting the same CPU, the task's domain doesn't need to be
@@ -641,6 +746,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bo
 		l3_mask = NULL;
 
 	idle_cpumask = scx_bpf_get_idle_cpumask();
+
 	/*
 	 * In case of a sync wakeup, attempt to run the wakee on the
 	 * waker's CPU if possible, as it's going to release the CPU right
@@ -958,6 +1064,9 @@ void BPF_STRUCT_OPS(bpfland_dispatch, s32 cpu, struct task_struct *prev)
 	if (scx_bpf_dsq_move_to_local(dsq_id)) 
 		return;
 
+	if (prev && keep_running(prev, cpu))
+		prev->scx.slice = slice_max;
+
 	return;
 }
 
@@ -1239,22 +1348,39 @@ int enable_sibling_cpu(struct domain_arg *input)
 }
 
 SEC("syscall")
-int enable_primary_cpu(struct cpu_arg *input)
+int enable_cpu(struct enable_cpu_arg *input)
 {
 	struct bpf_cpumask *mask;
+	struct bpf_cpumask **target_mask;
 	int err = 0;
 
-	/* Make sure the primary CPU mask is initialized */
-	err = init_cpumask(&primary_cpumask);
+	/* Select the target mask based on mask_type */
+	switch (input->mask_type) {
+	case 0: /* primary */
+		target_mask = &primary_cpumask;
+		break;
+	case 1: /* big */
+		target_mask = &big_cpumask;
+		break;
+	case 2: /* little */
+		target_mask = &little_cpumask;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	/* Make sure the target CPU mask is initialized */
+	err = init_cpumask(target_mask);
 	if (err)
 		return err;
+
 	/*
-	 * Enable the target CPU in the primary scheduling domain. If the
+	 * Enable the target CPU in the specified domain. If the
 	 * target CPU is a negative value, clear the whole mask (this can be
-	 * used to reset the primary domain).
+	 * used to reset the domain).
 	 */
 	bpf_rcu_read_lock();
-	mask = primary_cpumask;
+	mask = *target_mask;
 	if (mask) {
 		s32 cpu = input->cpu_id;
 
@@ -1357,11 +1483,10 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(bpfland_init)
 	case DSQ_MODE_CPU:
 		/* Create per-CPU DSQs */
 		bpf_for(cpu, 0, nr_cpu_ids) {
-			u64 dsq_id = SCX_DSQ_GLOBAL + 1 + cpu;
-			err = scx_bpf_create_dsq(dsq_id, cpu);
+			err = scx_bpf_create_dsq((u64) cpu, -1);
 			if (err) {
 				scx_bpf_error("failed to create per-CPU DSQ %llu for CPU %d: %d", 
-					     dsq_id, cpu, err);
+					     cpu, cpu, err);
 				return err;
 			}
 		}
@@ -1386,6 +1511,16 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(bpfland_init)
 
 	/* Initialize the primary scheduling domain */
 	err = init_cpumask(&primary_cpumask);
+	if (err)
+		return err;
+
+	/* Initialize the big CPU domain */
+	err = init_cpumask(&big_cpumask);
+	if (err)
+		return err;
+
+	/* Initialize the little CPU domain */
+	err = init_cpumask(&little_cpumask);
 	if (err)
 		return err;
 

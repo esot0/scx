@@ -49,6 +49,11 @@ struct cpu_arg {
 	s32 cpu_id;
 };
 
+struct enable_cpu_arg {
+	s32 cpu_id;
+	s32 mask_type;  /* 0 = primary, 1 = big, 2 = little */
+};
+
 struct domain_arg {
 	s32 lvl_id;
 	s32 cpu_id;
