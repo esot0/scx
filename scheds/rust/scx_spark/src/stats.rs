@@ -27,6 +27,18 @@ pub struct Metrics {
     pub nr_shared_dispatches: u64,
     #[stat(desc = "Number of GPU-using task dispatches")]
     pub nr_gpu_task_dispatches: u64,
+    #[stat(desc = "Number of inference workload dispatches")]
+    pub nr_inference_dispatches: u64,
+    #[stat(desc = "Number of training workload dispatches")]
+    pub nr_training_dispatches: u64,
+    #[stat(desc = "Number of validation workload dispatches")]
+    pub nr_validation_dispatches: u64,
+    #[stat(desc = "Number of preprocessing workload dispatches")]
+    pub nr_preprocessing_dispatches: u64,
+    #[stat(desc = "Number of data loading workload dispatches")]
+    pub nr_data_loading_dispatches: u64,
+    #[stat(desc = "Number of model loading workload dispatches")]
+    pub nr_model_loading_dispatches: u64,
 }
 
 impl Metrics {
@@ -42,6 +54,16 @@ impl Metrics {
             self.nr_shared_dispatches,
             self.nr_gpu_task_dispatches
         )?;
+        writeln!(
+            w,
+            "workloads -> inf: {:<5} train: {:<5} val: {:<5} prep: {:<5} data: {:<5} model: {:<5}",
+            self.nr_inference_dispatches,
+            self.nr_training_dispatches,
+            self.nr_validation_dispatches,
+            self.nr_preprocessing_dispatches,
+            self.nr_data_loading_dispatches,
+            self.nr_model_loading_dispatches
+        )?;
         Ok(())
     }
 
@@ -51,6 +73,12 @@ impl Metrics {
             nr_direct_dispatches: self.nr_direct_dispatches - rhs.nr_direct_dispatches,
             nr_shared_dispatches: self.nr_shared_dispatches - rhs.nr_shared_dispatches,
             nr_gpu_task_dispatches: self.nr_gpu_task_dispatches - rhs.nr_gpu_task_dispatches,
+            nr_inference_dispatches: self.nr_inference_dispatches - rhs.nr_inference_dispatches,
+            nr_training_dispatches: self.nr_training_dispatches - rhs.nr_training_dispatches,
+            nr_validation_dispatches: self.nr_validation_dispatches - rhs.nr_validation_dispatches,
+            nr_preprocessing_dispatches: self.nr_preprocessing_dispatches - rhs.nr_preprocessing_dispatches,
+            nr_data_loading_dispatches: self.nr_data_loading_dispatches - rhs.nr_data_loading_dispatches,
+            nr_model_loading_dispatches: self.nr_model_loading_dispatches - rhs.nr_model_loading_dispatches,
             ..self.clone()
         }
     }

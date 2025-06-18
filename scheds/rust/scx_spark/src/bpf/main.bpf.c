@@ -93,6 +93,16 @@ volatile u64 nr_kthread_dispatches, nr_direct_dispatches, nr_shared_dispatches;
 volatile u64 nr_gpu_task_dispatches;
 
 /*
+ * Workload type dispatch statistics.
+ */
+volatile u64 nr_inference_dispatches;
+volatile u64 nr_training_dispatches;
+volatile u64 nr_validation_dispatches;
+volatile u64 nr_preprocessing_dispatches;
+volatile u64 nr_data_loading_dispatches;
+volatile u64 nr_model_loading_dispatches;
+
+/*
  * Amount of currently running tasks.
  */
 volatile u64 nr_running;
@@ -148,6 +158,25 @@ struct {
 	__uint(max_entries, MAX_GPU_TASK_PIDS);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 } gpu_tid SEC(".maps");
+
+/*
+ * Workload type detection maps.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u32);
+	__type(value, struct workload_info);
+	__uint(max_entries, MAX_WORKLOAD_PIDS);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} workload_tgid SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u32);
+	__type(value, struct workload_info);
+	__uint(max_entries, MAX_WORKLOAD_PIDS);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} workload_tid SEC(".maps");
 
 /*
  * Mask of CPUs that the scheduler can use until the system becomes saturated,
@@ -212,6 +241,81 @@ struct {
 	__uint(max_entries, 1);
 } cpu_ctx_stor SEC(".maps");
 
+
+/*
+ * Detect workload type based on process name and behavior patterns.
+ */
+static void detect_workload_type(const struct task_struct *p, u32 pid, u32 tid) {
+	struct workload_info info = {0};
+	u64 now = bpf_ktime_get_ns();
+	
+	if (!p)
+		return;
+	
+	info.detection_time = now;
+	info.workload_type = WORKLOAD_TYPE_UNKNOWN;
+	
+	/* Use the comm field from the task_struct instead of bpf_get_current_comm */
+	char *comm = p->comm;
+	
+	/* Inference workload detection */
+	if (bpf_strncmp(comm, sizeof(p->comm), "inference") == 0 ||
+	    bpf_strncmp(comm, sizeof(p->comm), "predict") == 0 ||
+	    bpf_strncmp(comm, sizeof(p->comm), "serve") == 0 ||
+	    bpf_strncmp(comm, sizeof(p->comm), "model") == 0 ||
+	    bpf_strncmp(comm, sizeof(p->comm), "onnx") == 0 ||
+	    bpf_strncmp(comm, sizeof(p->comm), "tensorrt") == 0) {
+		info.workload_type = WORKLOAD_TYPE_INFERENCE;
+		bpf_trace_printk("Workload detected: PID %u -> INFERENCE\n", sizeof("Workload detected: PID %u -> INFERENCE\n"), pid);
+	}
+	/* Training workload detection */
+	else if (bpf_strncmp(comm, sizeof(p->comm), "train") == 0 ||
+	         bpf_strncmp(comm, sizeof(p->comm), "training") == 0 ||
+	         bpf_strncmp(comm, sizeof(p->comm), "fit") == 0 ||
+	         bpf_strncmp(comm, sizeof(p->comm), "learn") == 0 ||
+	         bpf_strncmp(comm, sizeof(p->comm), "optimize") == 0) {
+		info.workload_type = WORKLOAD_TYPE_TRAINING;
+		bpf_trace_printk("Workload detected: PID %u -> TRAINING\n", sizeof("Workload detected: PID %u -> TRAINING\n"), pid);
+	}
+	/* Validation workload detection */
+	else if (bpf_strncmp(comm, sizeof(p->comm), "validate") == 0 ||
+	         bpf_strncmp(comm, sizeof(p->comm), "eval") == 0 ||
+	         bpf_strncmp(comm, sizeof(p->comm), "test") == 0 ||
+	         bpf_strncmp(comm, sizeof(p->comm), "accuracy") == 0) {
+		info.workload_type = WORKLOAD_TYPE_VALIDATION;
+		bpf_trace_printk("Workload detected: PID %u -> VALIDATION\n", sizeof("Workload detected: PID %u -> VALIDATION\n"), pid);
+	}
+	/* Preprocessing workload detection */
+	else if (bpf_strncmp(comm, sizeof(p->comm), "preprocess") == 0 ||
+	         bpf_strncmp(comm, sizeof(p->comm), "augment") == 0 ||
+	         bpf_strncmp(comm, sizeof(p->comm), "transform") == 0 ||
+	         bpf_strncmp(comm, sizeof(p->comm), "normalize") == 0 ||
+	         bpf_strncmp(comm, sizeof(p->comm), "resize") == 0) {
+		info.workload_type = WORKLOAD_TYPE_PREPROCESSING;
+		bpf_trace_printk("Workload detected: PID %u -> PREPROCESSING\n", sizeof("Workload detected: PID %u -> PREPROCESSING\n"), pid);
+	}
+	/* Data loading workload detection */
+	else if (bpf_strncmp(comm, sizeof(p->comm), "dataloader") == 0 ||
+	         bpf_strncmp(comm, sizeof(p->comm), "dataset") == 0 ||
+	         bpf_strncmp(comm, sizeof(p->comm), "loader") == 0 ||
+	         bpf_strncmp(comm, sizeof(p->comm), "batch") == 0) {
+		info.workload_type = WORKLOAD_TYPE_DATA_LOADING;
+		bpf_trace_printk("Workload detected: PID %u -> DATA_LOADING\n", sizeof("Workload detected: PID %u -> DATA_LOADING\n"), pid);
+	}
+	/* Model loading workload detection */
+	else if (bpf_strncmp(comm, sizeof(p->comm), "load_model") == 0 ||
+	         bpf_strncmp(comm, sizeof(p->comm), "checkpoint") == 0 ||
+	         bpf_strncmp(comm, sizeof(p->comm), "restore") == 0 ||
+	         bpf_strncmp(comm, sizeof(p->comm), "import") == 0) {
+		info.workload_type = WORKLOAD_TYPE_MODEL_LOADING;
+		bpf_trace_printk("Workload detected: PID %u -> MODEL_LOADING\n", sizeof("Workload detected: PID %u -> MODEL_LOADING\n"), pid);
+	}
+	
+	if (tid)
+		bpf_map_update_elem(&workload_tid, &tid, &info, BPF_ANY);
+	bpf_map_update_elem(&workload_tgid, &pid, &info, BPF_ANY);
+}
+
 /*
  * Return a CPU context.
  */
@@ -228,16 +332,46 @@ struct cpu_ctx *try_lookup_cpu_ctx(s32 cpu)
 int save_gpu_tgid_pid() {
 	if (!enable_gpu_support)
 		return 0;
-	u64 pid_tgid;
 	u32 pid, tid, zero;
+	struct task_struct *current;
 	zero = 0;
 
-	pid_tgid = bpf_get_current_pid_tgid();
-	pid = pid_tgid >> 32;
-	tid = pid_tgid;
+	current = (void *)bpf_get_current_task_btf();
+	if (!current)
+		return -ENOENT;
+	
+	pid = current->tgid;
+	tid = current->pid;
+	
 	bpf_map_update_elem(&gpu_tid, &tid, &zero, BPF_ANY);
 	bpf_map_update_elem(&gpu_tgid, &pid, &zero, BPF_ANY);
+	
+	detect_workload_type(current, pid, tid);
+	
 	return 0;
+}
+
+
+
+/*
+ * Get workload type for a task.
+ */
+static u32 get_workload_type(const struct task_struct *p) {
+	u32 tid = p->pid;
+	u32 tgid = p->tgid;
+	struct workload_info *info;
+	
+	/* Check thread-specific workload info first */
+	info = bpf_map_lookup_elem(&workload_tid, &tid);
+	if (info && info->workload_type != WORKLOAD_TYPE_UNKNOWN)
+		return info->workload_type;
+	
+	/* Check process-level workload info */
+	info = bpf_map_lookup_elem(&workload_tgid, &tgid);
+	if (info && info->workload_type != WORKLOAD_TYPE_UNKNOWN)
+		return info->workload_type;
+	
+	return WORKLOAD_TYPE_UNKNOWN;
 }
 
 /*
@@ -306,6 +440,16 @@ struct task_ctx {
 	 */
 	bool is_gpu_task;
 
+	/*
+	 * Workload classification fields.
+	 */
+	u32 workload_type;
+	u64 gpu_usage_count;
+	u64 cpu_usage_time;
+	u64 io_operations;
+	u64 memory_allocations;
+	u64 last_gpu_access;
+	u64 last_cpu_access;
 };
 
 /*
@@ -328,6 +472,87 @@ int kprobe_nvidia_mmap() {
 	bpf_trace_printk("nvidia_mmap detected, saving pid/tid\n", sizeof("nvidia_mmap detected, saving pid/tid\n"));
 	return save_gpu_tgid_pid();
 }
+
+/*
+ * ML Framework detection kprobes.
+ */
+// SEC("kprobe/cudaLaunchKernel")
+// int kprobe_cuda_launch_kernel() {
+// 	u64 pid_tgid = bpf_get_current_pid_tgid();
+// 	u32 pid = pid_tgid >> 32;
+// 	u32 tid = pid_tgid;
+	
+// 	/* Mark as GPU task and detect workload type */
+// 	save_gpu_tgid_pid();
+	
+// 	/* Update workload info to indicate training/inference */
+// 	struct workload_info *info = bpf_map_lookup_elem(&workload_tid, &tid);
+// 	if (info) {
+// 		info->gpu_usage_count++;
+// 		info->detection_time = bpf_ktime_get_ns();
+// 		/* If not already classified, assume inference (most common) */
+// 		if (info->workload_type == WORKLOAD_TYPE_UNKNOWN)
+// 			info->workload_type = WORKLOAD_TYPE_INFERENCE;
+// 	}
+	
+// 	return 0;
+// }
+
+// SEC("kprobe/cudaMemcpy")
+// int kprobe_cuda_memcpy() {
+// 	u64 pid_tgid = bpf_get_current_pid_tgid();
+// 	u32 pid = pid_tgid >> 32;
+// 	u32 tid = pid_tgid;
+	
+// 	/* Mark as GPU task */
+// 	save_gpu_tgid_pid();
+	
+// 	/* Update workload info */
+// 	struct workload_info *info = bpf_map_lookup_elem(&workload_tid, &tid);
+// 	if (info) {
+// 		info->gpu_usage_count++;
+// 		info->detection_time = bpf_ktime_get_ns();
+// 	}
+	
+// 	return 0;
+// }
+
+// /*
+//  * System call kprobes for workload pattern detection.
+//  */
+// SEC("kprobe/do_readv_writev")
+// int kprobe_io_operations() {
+// 	u64 pid_tgid = bpf_get_current_pid_tgid();
+// 	u32 tid = pid_tgid;
+	
+// 	/* Update workload info for I/O operations */
+// 	struct workload_info *info = bpf_map_lookup_elem(&workload_tid, &tid);
+// 	if (info) {
+// 		info->io_operations++;
+// 		/* High I/O might indicate data loading or preprocessing */
+// 		if (info->workload_type == WORKLOAD_TYPE_UNKNOWN && info->io_operations > 10)
+// 			info->workload_type = WORKLOAD_TYPE_DATA_LOADING;
+// 	}
+	
+// 	return 0;
+// }
+
+// SEC("kprobe/do_mmap")
+// int kprobe_memory_allocations() {
+// 	u64 pid_tgid = bpf_get_current_pid_tgid();
+// 	u32 tid = pid_tgid;
+	
+// 	/* Update workload info for memory operations */
+// 	struct workload_info *info = bpf_map_lookup_elem(&workload_tid, &tid);
+// 	if (info) {
+// 		info->memory_allocations++;
+// 		/* Large memory allocations might indicate model loading */
+// 		if (info->workload_type == WORKLOAD_TYPE_UNKNOWN && info->memory_allocations > 5)
+// 			info->workload_type = WORKLOAD_TYPE_MODEL_LOADING;
+// 	}
+	
+// 	return 0;
+// }
 
 /* Map that contains task-local storage. */
 struct {
@@ -712,7 +937,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bo
 			}
 		}
 	}
-	 
+		
 
 	primary = cast_mask(primary_cpumask);
 	if (!primary)
@@ -724,7 +949,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bo
 	 * in the primary domain.
 	 */
 
-	  	if (!bpf_cpumask_test_cpu(prev_cpu, primary)) {
+	if (!bpf_cpumask_test_cpu(prev_cpu, primary)) {
 	  	cpu = bpf_cpumask_any_and_distribute(p->cpus_ptr, primary);
 	  	if (cpu >= nr_cpu_ids)
 	  		return prev_cpu;
@@ -849,6 +1074,10 @@ static bool can_direct_dispatch(s32 cpu)
 s32 BPF_STRUCT_OPS(bpfland_select_cpu, struct task_struct *p,
 			s32 prev_cpu, u64 wake_flags)
 {
+	bpf_trace_printk(
+		"select_cpu\n",
+		sizeof("select_cpu\n")
+	);
 	bool is_idle = false;
 	s32 cpu;
 
@@ -883,10 +1112,10 @@ static bool kick_idle_cpu(const struct task_struct *p, const struct task_ctx *tc
 	/*
 	 * Try to reuse the same CPU if idle.
 	 */
-		if (scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+	if (scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
 			scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
 			return true;
-		}
+	}
 
 	/*
 	 * Look for any idle CPU usable by the task that can immediately
@@ -1038,6 +1267,34 @@ void BPF_STRUCT_OPS(bpfland_enqueue, struct task_struct *p, u64 enq_flags)
 	__sync_fetch_and_add(&nr_shared_dispatches, 1);
 
 	/*
+	 * Track workload type dispatches.
+	 */
+	if (tctx->is_gpu_task) {
+		__sync_fetch_and_add(&nr_gpu_task_dispatches, 1);
+	}
+	
+	switch (tctx->workload_type) {
+	case WORKLOAD_TYPE_INFERENCE:
+		__sync_fetch_and_add(&nr_inference_dispatches, 1);
+		break;
+	case WORKLOAD_TYPE_TRAINING:
+		__sync_fetch_and_add(&nr_training_dispatches, 1);
+		break;
+	case WORKLOAD_TYPE_VALIDATION:
+		__sync_fetch_and_add(&nr_validation_dispatches, 1);
+		break;
+	case WORKLOAD_TYPE_PREPROCESSING:
+		__sync_fetch_and_add(&nr_preprocessing_dispatches, 1);
+		break;
+	case WORKLOAD_TYPE_DATA_LOADING:
+		__sync_fetch_and_add(&nr_data_loading_dispatches, 1);
+		break;
+	case WORKLOAD_TYPE_MODEL_LOADING:
+		__sync_fetch_and_add(&nr_model_loading_dispatches, 1);
+		break;
+	}
+
+	/*
 	 * If there are idle CPUs in the system try to proactively wake up
 	 * one, so that it can immediately execute the task in case its
 	 * current CPU is busy.
@@ -1116,16 +1373,50 @@ static void update_cpu_load(struct task_struct *p, struct task_ctx *tctx)
 	cctx->prev_runtime = cctx->tot_runtime;
 }
 
+/*
+ * Update workload statistics for a task.
+ */
+static void update_workload_stats(struct task_struct *p, struct task_ctx *tctx, u64 now)
+{
+	/* Update CPU usage time */
+	if (tctx->last_cpu_access > 0) {
+		tctx->cpu_usage_time += now - tctx->last_cpu_access;
+	}
+	tctx->last_cpu_access = now;
+	
+	/* Update workload type based on behavior patterns */
+	if (tctx->workload_type == WORKLOAD_TYPE_UNKNOWN) {
+		/* High GPU usage might indicate training */
+		if (tctx->gpu_usage_count > 100) {
+			tctx->workload_type = WORKLOAD_TYPE_TRAINING;
+		}
+		/* High I/O operations might indicate data loading */
+		else if (tctx->io_operations > 50) {
+			tctx->workload_type = WORKLOAD_TYPE_DATA_LOADING;
+		}
+		/* High memory allocations might indicate model loading */
+		else if (tctx->memory_allocations > 20) {
+			tctx->workload_type = WORKLOAD_TYPE_MODEL_LOADING;
+		}
+	}
+}
+
 void BPF_STRUCT_OPS(bpfland_running, struct task_struct *p)
 {
 	struct task_ctx *tctx;
+	u64 now = scx_bpf_now();
 
 	__sync_fetch_and_add(&nr_running, 1);
 
 	tctx = try_lookup_task_ctx(p);
 	if (!tctx)
 		return;
-	tctx->last_run_at = scx_bpf_now();
+	tctx->last_run_at = now;
+
+	/*
+	 * Update workload statistics.
+	 */
+	update_workload_stats(p, tctx, now);
 
 	/*
 	 * Adjust target CPU frequency before the task starts to run.
@@ -1246,11 +1537,28 @@ s32 BPF_STRUCT_OPS(bpfland_init_task, struct task_struct *p,
 				    BPF_LOCAL_STORAGE_GET_F_CREATE);
 	if (!tctx)
 		return -ENOMEM;
-
+static const char fmt[] = "test\n";
+		bpf_trace_printk(
+		fmt,
+		sizeof(fmt)
+		);
 	/*
 	 * Detect if this task is using GPU.
 	 */
 	tctx->is_gpu_task = is_gpu_task(p);
+
+	/*
+	 * Initialize workload classification fields.
+	 */
+
+	 detect_workload_type(p, p->pid, 0);
+	tctx->workload_type = get_workload_type(p);
+	tctx->gpu_usage_count = 0;
+	tctx->cpu_usage_time = 0;
+	tctx->io_operations = 0;
+	tctx->memory_allocations = 0;
+	tctx->last_gpu_access = 0;
+	tctx->last_cpu_access = 0;
 
 	/*
 	 * Create task's primary cpumask.
@@ -1565,4 +1873,4 @@ SCX_OPS_DEFINE(bpfland_ops,
 	       .init			= (void *)bpfland_init,
 	       .exit			= (void *)bpfland_exit,
 	       .timeout_ms		= 5000,
-	       .name			= "bpfland");
+	       .name			= "spark");

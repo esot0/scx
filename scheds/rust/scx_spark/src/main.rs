@@ -294,6 +294,23 @@ struct Opts {
     #[clap(long, action = clap::ArgAction::SetTrue)]
     aggressive_gpu_tasks: bool,
 
+    /// Enable advanced workload type detection for ML workloads.
+    ///
+    /// When enabled, the scheduler will attempt to classify tasks as inference,
+    /// training, validation, preprocessing, data loading, or model loading based
+    /// on process names, GPU usage patterns, and system call behavior.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    enable_workload_detection: bool,
+
+    /// Workload-aware scheduling mode.
+    ///
+    /// When enabled with --enable-workload-detection, the scheduler will make
+    /// CPU selection decisions based on workload type: inference tasks get
+    /// priority on big cores, data loading/preprocessing prefer little cores,
+    /// and training tasks can use either based on availability.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    workload_aware_scheduling: bool,
+
     /// Enable verbose output, including libbpf details.
     #[clap(short = 'v', long, action = clap::ArgAction::SetTrue)]
     verbose: bool,
@@ -388,6 +405,14 @@ impl<'a> Scheduler<'a> {
 
         if opts.aggressive_gpu_tasks && opts.enable_gpu_support {
             info!("Aggressive GPU mode enabled - only GPU tasks can use big/performance cores");
+        }
+
+        // Enable workload detection if requested.
+        if opts.enable_workload_detection {
+            info!("Woorkload detection enabled. Classifying ML workloads");
+            if opts.workload_aware_scheduling {
+                info!("Workload-aware scheduling enabled. Optimizing CPU selection based on workload type");
+            }
         }
 
         // Implicitly enable direct dispatch of per-CPU kthreads if CPU throttling is enabled
@@ -715,6 +740,12 @@ impl<'a> Scheduler<'a> {
             nr_direct_dispatches: self.skel.maps.bss_data.nr_direct_dispatches,
             nr_shared_dispatches: self.skel.maps.bss_data.nr_shared_dispatches,
             nr_gpu_task_dispatches: self.skel.maps.bss_data.nr_gpu_task_dispatches,
+            nr_inference_dispatches: self.skel.maps.bss_data.nr_inference_dispatches,
+            nr_training_dispatches: self.skel.maps.bss_data.nr_training_dispatches,
+            nr_validation_dispatches: self.skel.maps.bss_data.nr_validation_dispatches,
+            nr_preprocessing_dispatches: self.skel.maps.bss_data.nr_preprocessing_dispatches,
+            nr_data_loading_dispatches: self.skel.maps.bss_data.nr_data_loading_dispatches,
+            nr_model_loading_dispatches: self.skel.maps.bss_data.nr_model_loading_dispatches,
         }
     }
 
