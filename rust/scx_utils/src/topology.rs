@@ -661,6 +661,8 @@ fn get_capacity_source() -> Option<CapacitySource> {
         // Note that we need a more systematic approach to accurately detect
         // big/LITTLE architectures across various SoC designs. The current
         // approach, with a significant capacity difference, is somewhat ad-hoc.
+
+        println!("max_rcap: {}, min_rcap: {}", max_rcap, min_rcap);
         has_biglittle = max_rcap as f32 >= (1.3 * min_rcap as f32);
     }
 

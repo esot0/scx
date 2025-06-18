@@ -19,7 +19,7 @@ cleanup() {
     if [ -n "$SCHED_PID" ]; then
         kill $SCHED_PID 2>/dev/null || true
     fi
-    echo 0 > /sys/kernel/debug/sched_ext/current_sched_ext 2>/dev/null || true
+    echo 0 > /sys/sched_ext/current_sched_ext 2>/dev/null || true
 }
 
 trap cleanup EXIT
