@@ -35,6 +35,7 @@ use clap::Parser;
 use crossbeam::channel::RecvTimeoutError;
 use libbpf_rs::OpenObject;
 use libbpf_rs::ProgramInput;
+use libbpf_rs::OpenProgram;
 use log::warn;
 use log::{debug, info};
 use scx_stats::prelude::*;
@@ -431,6 +432,15 @@ impl<'a> Scheduler<'a> {
 
         // Load the BPF program for validation.
         let mut skel = scx_ops_load!(skel, bpfland_ops, uei)?;
+
+        // Disable kprobe autoload if GPU support is not enabled
+        if !opts.enable_gpu_support {
+            unsafe {
+                set_autoload(skel.progs.kprobe_nvidia_poll.as_libbpf_object().as_ptr(), false);
+                set_autoload(skel.progs.kprobe_nvidia_open.as_libbpf_object().as_ptr(), false);
+                set_autoload(skel.progs.kprobe_nvidia_mmap.as_libbpf_object().as_ptr(), false);
+            }
+        }
 
         // Initialize the primary scheduling domain and the preferred domain.
         let power_profile = Self::power_profile();
