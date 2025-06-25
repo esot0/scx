@@ -459,6 +459,12 @@ impl<'a> Scheduler<'a> {
 
         // Attach the scheduler.
         let struct_ops = Some(scx_ops_attach!(skel, bpfland_ops)?);
+        
+        // Conditionally attach GPU kprobes if GPU support is enabled
+        if opts.enable_gpu_support {
+            Self::attach_gpu_kprobes(&mut skel)?;
+        }
+        
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
 
         Ok(Self {
@@ -589,6 +595,51 @@ impl<'a> Scheduler<'a> {
             }
         }
 
+        Ok(())
+    }
+
+    fn attach_gpu_kprobes(skel: &mut BpfSkel<'_>) -> Result<()> {
+        use libbpf_rs::Link;
+        use std::collections::HashMap;
+        
+        // Store kprobe links to keep them alive
+        let mut kprobe_links: HashMap<String, Link> = HashMap::new();
+        
+        // List of kprobes to attach for GPU detection
+        let kprobes = vec![
+            ("nvidia_poll", "nvidia_poll"),
+            ("nvidia_open", "nvidia_open"), 
+            ("nvidia_mmap", "nvidia_mmap"),
+        ];
+        
+        for (prog_name, kprobe_name) in kprobes {
+            let prog = match prog_name {
+                "nvidia_poll" => &skel.progs.kprobe_nvidia_poll,
+                "nvidia_open" => &skel.progs.kprobe_nvidia_open,
+                "nvidia_mmap" => &skel.progs.kprobe_nvidia_mmap,
+                _ => {
+                    warn!("Unknown kprobe program: {}", prog_name);
+                    continue;
+                }
+            };
+            
+            match prog.attach_kprobe(false, kprobe_name) {
+                Ok(link) => {
+                    info!("Successfully attached kprobe {} -> {}", prog_name, kprobe_name);
+                    kprobe_links.insert(prog_name.to_string(), link);
+                }
+                Err(e) => {
+                    warn!("Failed to attach kprobe {} -> {}: {}", prog_name, kprobe_name, e);
+                }
+            }
+        }
+        
+        if !kprobe_links.is_empty() {
+            info!("Attached {} GPU kprobes", kprobe_links.len());
+        } else {
+            warn!("No GPU kprobes were successfully attached");
+        }
+        
         Ok(())
     }
 

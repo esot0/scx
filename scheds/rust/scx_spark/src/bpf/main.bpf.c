@@ -246,6 +246,9 @@ struct {
  * Detect workload type based on process name and behavior patterns.
  */
 static void detect_workload_type(const struct task_struct *p, u32 pid, u32 tid) {
+	if (!enable_gpu_support)
+		return;
+		
 	struct workload_info info = {0};
 	u64 now = bpf_ktime_get_ns();
 	
@@ -357,6 +360,9 @@ int save_gpu_tgid_pid() {
  * Get workload type for a task.
  */
 static u32 get_workload_type(const struct task_struct *p) {
+	if (!enable_gpu_support)
+		return WORKLOAD_TYPE_UNKNOWN;
+		
 	u32 tid = p->pid;
 	u32 tgid = p->tgid;
 	struct workload_info *info;
@@ -455,6 +461,7 @@ struct task_ctx {
 /*
  * GPU detection kprobes.
  */
+
 SEC("kprobe/nvidia_poll")
 int kprobe_nvidia_poll() {
 	bpf_printk("nvidia_poll detected, saving pid/tid\n");
@@ -1265,29 +1272,31 @@ void BPF_STRUCT_OPS(bpfland_enqueue, struct task_struct *p, u64 enq_flags)
 	/*
 	 * Track workload type dispatches.
 	 */
-	if (tctx->is_gpu_task) {
-		__sync_fetch_and_add(&nr_gpu_task_dispatches, 1);
-	}
-	
-	switch (tctx->workload_type) {
-	case WORKLOAD_TYPE_INFERENCE:
-		__sync_fetch_and_add(&nr_inference_dispatches, 1);
-		break;
-	case WORKLOAD_TYPE_TRAINING:
-		__sync_fetch_and_add(&nr_training_dispatches, 1);
-		break;
-	case WORKLOAD_TYPE_VALIDATION:
-		__sync_fetch_and_add(&nr_validation_dispatches, 1);
-		break;
-	case WORKLOAD_TYPE_PREPROCESSING:
-		__sync_fetch_and_add(&nr_preprocessing_dispatches, 1);
-		break;
-	case WORKLOAD_TYPE_DATA_LOADING:
-		__sync_fetch_and_add(&nr_data_loading_dispatches, 1);
-		break;
-	case WORKLOAD_TYPE_MODEL_LOADING:
-		__sync_fetch_and_add(&nr_model_loading_dispatches, 1);
-		break;
+	if (enable_gpu_support) {
+		if (tctx->is_gpu_task) {
+			__sync_fetch_and_add(&nr_gpu_task_dispatches, 1);
+		}
+		
+		switch (tctx->workload_type) {
+		case WORKLOAD_TYPE_INFERENCE:
+			__sync_fetch_and_add(&nr_inference_dispatches, 1);
+			break;
+		case WORKLOAD_TYPE_TRAINING:
+			__sync_fetch_and_add(&nr_training_dispatches, 1);
+			break;
+		case WORKLOAD_TYPE_VALIDATION:
+			__sync_fetch_and_add(&nr_validation_dispatches, 1);
+			break;
+		case WORKLOAD_TYPE_PREPROCESSING:
+			__sync_fetch_and_add(&nr_preprocessing_dispatches, 1);
+			break;
+		case WORKLOAD_TYPE_DATA_LOADING:
+			__sync_fetch_and_add(&nr_data_loading_dispatches, 1);
+			break;
+		case WORKLOAD_TYPE_MODEL_LOADING:
+			__sync_fetch_and_add(&nr_model_loading_dispatches, 1);
+			break;
+		}
 	}
 
 	/*
@@ -1374,6 +1383,9 @@ static void update_cpu_load(struct task_struct *p, struct task_ctx *tctx)
  */
 static void update_workload_stats(struct task_struct *p, struct task_ctx *tctx, u64 now)
 {
+	if (!enable_gpu_support)
+		return;
+		
 	/* Update CPU usage time */
 	if (tctx->last_cpu_access > 0) {
 		tctx->cpu_usage_time += now - tctx->last_cpu_access;
@@ -1412,7 +1424,9 @@ void BPF_STRUCT_OPS(bpfland_running, struct task_struct *p)
 	/*
 	 * Update workload statistics.
 	 */
-	update_workload_stats(p, tctx, now);
+	if (enable_gpu_support) {
+		update_workload_stats(p, tctx, now);
+	}
 
 	/*
 	 * Adjust target CPU frequency before the task starts to run.
@@ -1537,20 +1551,21 @@ s32 BPF_STRUCT_OPS(bpfland_init_task, struct task_struct *p,
 	/*
 	 * Detect if this task is using GPU.
 	 */
-	tctx->is_gpu_task = is_gpu_task(p);
+	if (enable_gpu_support) {
+		tctx->is_gpu_task = is_gpu_task(p);
 
-	/*
-	 * Initialize workload classification fields.
-	 */
-
-	 detect_workload_type(p, p->pid, 0);
-	tctx->workload_type = get_workload_type(p);
-	tctx->gpu_usage_count = 0;
-	tctx->cpu_usage_time = 0;
-	tctx->io_operations = 0;
-	tctx->memory_allocations = 0;
-	tctx->last_gpu_access = 0;
-	tctx->last_cpu_access = 0;
+		/*
+		 * Initialize workload classification fields.
+		 */
+		detect_workload_type(p, p->pid, 0);
+		tctx->workload_type = get_workload_type(p);
+		tctx->gpu_usage_count = 0;
+		tctx->cpu_usage_time = 0;
+		tctx->io_operations = 0;
+		tctx->memory_allocations = 0;
+		tctx->last_gpu_access = 0;
+		tctx->last_cpu_access = 0;
+	}
 
 	/*
 	 * Create task's primary cpumask.
