@@ -266,7 +266,7 @@ static void detect_workload_type(const struct task_struct *p, u32 pid, u32 tid) 
 	    bpf_strncmp(comm, sizeof(p->comm), "onnx") == 0 ||
 	    bpf_strncmp(comm, sizeof(p->comm), "tensorrt") == 0) {
 		info.workload_type = WORKLOAD_TYPE_INFERENCE;
-		bpf_trace_printk("Workload detected: PID %u -> INFERENCE\n", sizeof("Workload detected: PID %u -> INFERENCE\n"), pid);
+		bpf_printk("Workload detected: PID %u -> INFERENCE\n", pid);
 	}
 	/* Training workload detection */
 	else if (bpf_strncmp(comm, sizeof(p->comm), "train") == 0 ||
@@ -275,7 +275,7 @@ static void detect_workload_type(const struct task_struct *p, u32 pid, u32 tid) 
 	         bpf_strncmp(comm, sizeof(p->comm), "learn") == 0 ||
 	         bpf_strncmp(comm, sizeof(p->comm), "optimize") == 0) {
 		info.workload_type = WORKLOAD_TYPE_TRAINING;
-		bpf_trace_printk("Workload detected: PID %u -> TRAINING\n", sizeof("Workload detected: PID %u -> TRAINING\n"), pid);
+		bpf_printk("Workload detected: PID %u -> TRAINING\n", pid);
 	}
 	/* Validation workload detection */
 	else if (bpf_strncmp(comm, sizeof(p->comm), "validate") == 0 ||
@@ -283,7 +283,7 @@ static void detect_workload_type(const struct task_struct *p, u32 pid, u32 tid) 
 	         bpf_strncmp(comm, sizeof(p->comm), "test") == 0 ||
 	         bpf_strncmp(comm, sizeof(p->comm), "accuracy") == 0) {
 		info.workload_type = WORKLOAD_TYPE_VALIDATION;
-		bpf_trace_printk("Workload detected: PID %u -> VALIDATION\n", sizeof("Workload detected: PID %u -> VALIDATION\n"), pid);
+		bpf_printk("Workload detected: PID %u -> VALIDATION\n", pid);
 	}
 	/* Preprocessing workload detection */
 	else if (bpf_strncmp(comm, sizeof(p->comm), "preprocess") == 0 ||
@@ -292,7 +292,7 @@ static void detect_workload_type(const struct task_struct *p, u32 pid, u32 tid) 
 	         bpf_strncmp(comm, sizeof(p->comm), "normalize") == 0 ||
 	         bpf_strncmp(comm, sizeof(p->comm), "resize") == 0) {
 		info.workload_type = WORKLOAD_TYPE_PREPROCESSING;
-		bpf_trace_printk("Workload detected: PID %u -> PREPROCESSING\n", sizeof("Workload detected: PID %u -> PREPROCESSING\n"), pid);
+		bpf_printk("Workload detected: PID %u -> PREPROCESSING\n", pid);
 	}
 	/* Data loading workload detection */
 	else if (bpf_strncmp(comm, sizeof(p->comm), "dataloader") == 0 ||
@@ -300,7 +300,7 @@ static void detect_workload_type(const struct task_struct *p, u32 pid, u32 tid) 
 	         bpf_strncmp(comm, sizeof(p->comm), "loader") == 0 ||
 	         bpf_strncmp(comm, sizeof(p->comm), "batch") == 0) {
 		info.workload_type = WORKLOAD_TYPE_DATA_LOADING;
-		bpf_trace_printk("Workload detected: PID %u -> DATA_LOADING\n", sizeof("Workload detected: PID %u -> DATA_LOADING\n"), pid);
+		bpf_printk("Workload detected: PID %u -> DATA_LOADING\n", pid);
 	}
 	/* Model loading workload detection */
 	else if (bpf_strncmp(comm, sizeof(p->comm), "load_model") == 0 ||
@@ -308,7 +308,7 @@ static void detect_workload_type(const struct task_struct *p, u32 pid, u32 tid) 
 	         bpf_strncmp(comm, sizeof(p->comm), "restore") == 0 ||
 	         bpf_strncmp(comm, sizeof(p->comm), "import") == 0) {
 		info.workload_type = WORKLOAD_TYPE_MODEL_LOADING;
-		bpf_trace_printk("Workload detected: PID %u -> MODEL_LOADING\n", sizeof("Workload detected: PID %u -> MODEL_LOADING\n"), pid);
+		bpf_printk("Workload detected: PID %u -> MODEL_LOADING\n", pid);
 	}
 	
 	if (tid)
@@ -457,19 +457,19 @@ struct task_ctx {
  */
 SEC("kprobe/nvidia_poll")
 int kprobe_nvidia_poll() {
-	bpf_trace_printk("nvidia_poll detected, saving pid/tid\n", sizeof("nvidia_poll detected, saving pid/tid\n"));
+	bpf_printk("nvidia_poll detected, saving pid/tid\n");
 	return save_gpu_tgid_pid();
 }
 
 SEC("kprobe/nvidia_open")
 int kprobe_nvidia_open() {
-	bpf_trace_printk("nvidia_open detected, saving pid/tid\n", sizeof("nvidia_open detected, saving pid/tid\n"));
+	bpf_printk("nvidia_open detected, saving pid/tid\n");
 	return save_gpu_tgid_pid();
 }
 
 SEC("kprobe/nvidia_mmap")
 int kprobe_nvidia_mmap() {
-	bpf_trace_printk("nvidia_mmap detected, saving pid/tid\n", sizeof("nvidia_mmap detected, saving pid/tid\n"));
+	bpf_printk("nvidia_mmap detected, saving pid/tid\n");
 	return save_gpu_tgid_pid();
 }
 
@@ -1074,10 +1074,6 @@ static bool can_direct_dispatch(s32 cpu)
 s32 BPF_STRUCT_OPS(bpfland_select_cpu, struct task_struct *p,
 			s32 prev_cpu, u64 wake_flags)
 {
-	bpf_trace_printk(
-		"select_cpu\n",
-		sizeof("select_cpu\n")
-	);
 	bool is_idle = false;
 	s32 cpu;
 
@@ -1537,11 +1533,7 @@ s32 BPF_STRUCT_OPS(bpfland_init_task, struct task_struct *p,
 				    BPF_LOCAL_STORAGE_GET_F_CREATE);
 	if (!tctx)
 		return -ENOMEM;
-static const char fmt[] = "test\n";
-		bpf_trace_printk(
-		fmt,
-		sizeof(fmt)
-		);
+
 	/*
 	 * Detect if this task is using GPU.
 	 */
