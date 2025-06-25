@@ -35,7 +35,9 @@ use clap::Parser;
 use crossbeam::channel::RecvTimeoutError;
 use libbpf_rs::OpenObject;
 use libbpf_rs::ProgramInput;
-use libbpf_rs::OpenProgram;
+use libbpf_rs::OpenProgramImpl;
+use libbpf_rs::AsRawLibbpf;
+
 use log::warn;
 use log::{debug, info};
 use scx_stats::prelude::*;
@@ -436,9 +438,9 @@ impl<'a> Scheduler<'a> {
         // Disable kprobe autoload if GPU support is not enabled
         if !opts.enable_gpu_support {
             unsafe {
-                set_autoload(skel.progs.kprobe_nvidia_poll.as_libbpf_object().as_ptr(), false);
-                set_autoload(skel.progs.kprobe_nvidia_open.as_libbpf_object().as_ptr(), false);
-                set_autoload(skel.progs.kprobe_nvidia_mmap.as_libbpf_object().as_ptr(), false);
+                bpf_program__set_autoload(skel.progs.kprobe_nvidia_poll.as_libbpf_object().as_ptr(), false);
+                bpf_program__set_autoload(skel.progs.kprobe_nvidia_open.as_libbpf_object().as_ptr(), false);
+                bpf_program__set_autoload(skel.progs.kprobe_nvidia_mmap.as_libbpf_object().as_ptr(), false);
             }
         }
 
