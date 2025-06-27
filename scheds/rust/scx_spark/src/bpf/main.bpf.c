@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/*
+/* 
  * Copyright (c) 2024 Andrea Righi <andrea.righi@linux.dev>
  */
 #include <scx/common.bpf.h>
@@ -195,6 +195,11 @@ private(BPFLAND) struct bpf_cpumask __kptr *big_cpumask;
 private(BPFLAND) struct bpf_cpumask __kptr *little_cpumask;
 
 /*
+ * Mask of Turbo (performance) CPUs.
+ */
+private(BPFLAND) struct bpf_cpumask __kptr *turbo_cpumask;
+
+/*
  * DSQ dispatch mode.
  */
 const volatile u32 dsq_mode = 0;
@@ -269,7 +274,7 @@ static void detect_workload_type(const struct task_struct *p, u32 pid, u32 tid) 
 	    bpf_strncmp(comm, sizeof(p->comm), "onnx") == 0 ||
 	    bpf_strncmp(comm, sizeof(p->comm), "tensorrt") == 0) {
 		info.workload_type = WORKLOAD_TYPE_INFERENCE;
-		bpf_printk("Workload detected: PID %u -> INFERENCE\n", pid);
+		// bpf_printk("Workload detected: PID %u -> INFERENCE\n", pid);
 	}
 	/* Training workload detection */
 	else if (bpf_strncmp(comm, sizeof(p->comm), "train") == 0 ||
@@ -278,7 +283,7 @@ static void detect_workload_type(const struct task_struct *p, u32 pid, u32 tid) 
 	         bpf_strncmp(comm, sizeof(p->comm), "learn") == 0 ||
 	         bpf_strncmp(comm, sizeof(p->comm), "optimize") == 0) {
 		info.workload_type = WORKLOAD_TYPE_TRAINING;
-		bpf_printk("Workload detected: PID %u -> TRAINING\n", pid);
+		// bpf_printk("Workload detected: PID %u -> TRAINING\n", pid);
 	}
 	/* Validation workload detection */
 	else if (bpf_strncmp(comm, sizeof(p->comm), "validate") == 0 ||
@@ -286,7 +291,7 @@ static void detect_workload_type(const struct task_struct *p, u32 pid, u32 tid) 
 	         bpf_strncmp(comm, sizeof(p->comm), "test") == 0 ||
 	         bpf_strncmp(comm, sizeof(p->comm), "accuracy") == 0) {
 		info.workload_type = WORKLOAD_TYPE_VALIDATION;
-		bpf_printk("Workload detected: PID %u -> VALIDATION\n", pid);
+		// bpf_printk("Workload detected: PID %u -> VALIDATION\n", pid);
 	}
 	/* Preprocessing workload detection */
 	else if (bpf_strncmp(comm, sizeof(p->comm), "preprocess") == 0 ||
@@ -295,7 +300,7 @@ static void detect_workload_type(const struct task_struct *p, u32 pid, u32 tid) 
 	         bpf_strncmp(comm, sizeof(p->comm), "normalize") == 0 ||
 	         bpf_strncmp(comm, sizeof(p->comm), "resize") == 0) {
 		info.workload_type = WORKLOAD_TYPE_PREPROCESSING;
-		bpf_printk("Workload detected: PID %u -> PREPROCESSING\n", pid);
+		// bpf_printk("Workload detected: PID %u -> PREPROCESSING\n", pid);
 	}
 	/* Data loading workload detection */
 	else if (bpf_strncmp(comm, sizeof(p->comm), "dataloader") == 0 ||
@@ -303,7 +308,7 @@ static void detect_workload_type(const struct task_struct *p, u32 pid, u32 tid) 
 	         bpf_strncmp(comm, sizeof(p->comm), "loader") == 0 ||
 	         bpf_strncmp(comm, sizeof(p->comm), "batch") == 0) {
 		info.workload_type = WORKLOAD_TYPE_DATA_LOADING;
-		bpf_printk("Workload detected: PID %u -> DATA_LOADING\n", pid);
+		// bpf_printk("Workload detected: PID %u -> DATA_LOADING\n", pid);
 	}
 	/* Model loading workload detection */
 	else if (bpf_strncmp(comm, sizeof(p->comm), "load_model") == 0 ||
@@ -311,7 +316,7 @@ static void detect_workload_type(const struct task_struct *p, u32 pid, u32 tid) 
 	         bpf_strncmp(comm, sizeof(p->comm), "restore") == 0 ||
 	         bpf_strncmp(comm, sizeof(p->comm), "import") == 0) {
 		info.workload_type = WORKLOAD_TYPE_MODEL_LOADING;
-		bpf_printk("Workload detected: PID %u -> MODEL_LOADING\n", pid);
+		// bpf_printk("Workload detected: PID %u -> MODEL_LOADING\n", pid);
 	}
 	
 	if (tid)
@@ -391,8 +396,14 @@ static bool is_gpu_task(const struct task_struct *p)
 	u32 tid = p->pid;
 	u32 tgid = p->tgid;
 	
-	return bpf_map_lookup_elem(&gpu_tid, &tid) != NULL ||
+	bool is_gpu = bpf_map_lookup_elem(&gpu_tid, &tid) != NULL ||
 	       bpf_map_lookup_elem(&gpu_tgid, &tgid) != NULL;
+	
+	if (is_gpu) {
+		bpf_printk("GPU task detected: %s (PID: %u, TID: %u)\n", p->comm, tgid, tid);
+	}
+	
+	return is_gpu;
 }
 
 /*
@@ -464,19 +475,19 @@ struct task_ctx {
 
 SEC("kprobe/nvidia_poll")
 int kprobe_nvidia_poll() {
-	bpf_printk("nvidia_poll detected, saving pid/tid\n");
+	// bpf_printk("nvidia_poll detected, saving pid/tid\n");
 	return save_gpu_tgid_pid();
 }
 
 SEC("kprobe/nvidia_open")
 int kprobe_nvidia_open() {
-	bpf_printk("nvidia_open detected, saving pid/tid\n");
+	// bpf_printk("nvidia_open detected, saving pid/tid\n");
 	return save_gpu_tgid_pid();
 }
 
 SEC("kprobe/nvidia_mmap")
 int kprobe_nvidia_mmap() {
-	bpf_printk("nvidia_mmap detected, saving pid/tid\n");
+	// bpf_printk("nvidia_mmap detected, saving pid/tid\n");
 	return save_gpu_tgid_pid();
 }
 
@@ -871,15 +882,31 @@ static s32 find_idle_cpu_in_mask(const struct cpumask *mask, u64 flags)
 static s32 pick_idle_cpu_gpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bool *is_idle)
 {
 	const struct cpumask *big_mask;
+	const struct cpumask *turbo_mask;
 	s32 cpu = -1;
 
 	big_mask = cast_mask(big_cpumask);
+	turbo_mask = cast_mask(turbo_cpumask);
 	if (big_mask && bpf_cpumask_empty(big_mask)){
 		big_mask = NULL;
+		turbo_mask = NULL;
 		return prev_cpu;
 	}
 
-			/*
+	if(turbo_mask && bpf_cpumask_empty(turbo_mask)){
+		turbo_mask = NULL;
+	}
+
+
+/*Try looking for idle turbo CPUs, even if it's not a cache sibling. NOTE: This will probably happen dynamically based on cache sensitivity when workload detection improves.*/
+if(turbo_mask){
+	cpu = find_idle_cpu_in_mask(turbo_mask, 0);
+	if(cpu >= 0){
+		*is_idle = true;
+		return cpu;
+	}
+}
+	/*
 	 * Try to re-use the same CPU if it's a big CPU.
 	 */
 	if (big_mask && bpf_cpumask_test_cpu(prev_cpu, big_mask) && scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
@@ -1680,6 +1707,9 @@ int enable_cpu(struct enable_cpu_arg *input)
 	case 2: /* little */
 		target_mask = &little_cpumask;
 		break;
+	case 3: /* turbo */
+		target_mask = &turbo_cpumask;
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -1836,6 +1866,11 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(bpfland_init)
 
 	/* Initialize the little CPU domain */
 	err = init_cpumask(&little_cpumask);
+	if (err)
+		return err;
+
+	/* Initialize the turbo CPU domain */
+	err = init_cpumask(&turbo_cpumask);
 	if (err)
 		return err;
 

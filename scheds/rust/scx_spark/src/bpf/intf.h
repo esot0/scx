@@ -64,7 +64,7 @@ struct cpu_arg {
 
 struct enable_cpu_arg {
 	s32 cpu_id;
-	s32 mask_type;  /* 0 = primary, 1 = big, 2 = little */
+	s32 mask_type;  /* 0 = primary, 1 = big, 2 = little, 3 = turbo */
 };
 
 struct domain_arg {

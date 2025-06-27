@@ -18,6 +18,7 @@ const DSQ_MODE_SHARED: u32 = 2;
 const MASK_TYPE_PRIMARY: i32 = 0;
 const MASK_TYPE_BIG: i32 = 1;
 const MASK_TYPE_LITTLE: i32 = 2;
+const MASK_TYPE_TURBO: i32 = 3;
 
 mod stats;
 use std::collections::BTreeMap;
@@ -37,6 +38,7 @@ use libbpf_rs::OpenObject;
 use libbpf_rs::ProgramInput;
 use libbpf_rs::OpenProgramImpl;
 use libbpf_rs::AsRawLibbpf;
+use libbpf_rs::libbpf_sys::bpf_program__set_autoload;
 
 use log::warn;
 use log::{debug, info};
@@ -112,6 +114,23 @@ fn get_little_cpus() -> std::io::Result<Vec<usize>> {
         .flat_map(|core| &core.cpus)
         .filter_map(|(cpu_id, cpu)| match &cpu.core_type {
             CoreType::Little => Some(*cpu_id),
+            _ => None,
+        })
+        .collect();
+
+    Ok(cpus)
+}
+
+/// Get a list of CPU IDs that have turbo boost capability.
+fn get_turbo_cpus() -> std::io::Result<Vec<usize>> {
+    let topo = Topology::new().unwrap();
+
+    let cpus: Vec<usize> = topo
+        .all_cores
+        .values()
+        .flat_map(|core| &core.cpus)
+        .filter_map(|(cpu_id, cpu)| match &cpu.core_type {
+            CoreType::Big { turbo: true } => Some(*cpu_id),
             _ => None,
         })
         .collect();
@@ -396,21 +415,22 @@ impl<'a> Scheduler<'a> {
             "shared" | _ => DSQ_MODE_SHARED,
         };
 
-        // Enable GPU support if requested.
         skel.maps.rodata_data.enable_gpu_support = opts.enable_gpu_support;
 
         if opts.enable_gpu_support {
             info!("GPU support enabled.");
         }
 
-        // Enable aggressive GPU tasks mode if requested.
-        skel.maps.rodata_data.aggressive_gpu_tasks = opts.aggressive_gpu_tasks;
+        skel.maps.rodata_data.aggressive_gpu_tasks = opts.aggressive_gpu_tasks && opts.enable_gpu_support;
 
-        if opts.aggressive_gpu_tasks && opts.enable_gpu_support {
-            info!("Aggressive GPU mode enabled - only GPU tasks can use big/performance cores");
+    if opts.aggressive_gpu_tasks && !opts.enable_gpu_support {
+            return Err(anyhow::anyhow!(
+                "Error: --aggressive-gpu-tasks requires --enable-gpu-support to be enabled.\n\n\
+                Correct usage:\n\
+                sudo scx_spark --enable-gpu-support --aggressive-gpu-tasks\n\n"
+            ));
         }
 
-        // Enable workload detection if requested.
         if opts.enable_workload_detection {
             info!("Woorkload detection enabled. Classifying ML workloads");
             if opts.workload_aware_scheduling {
@@ -431,18 +451,38 @@ impl<'a> Scheduler<'a> {
             "scheduler flags: {:#x}",
             skel.struct_ops.bpfland_ops_mut().flags
         );
+                   
+        if !opts.enable_gpu_support {
+            unsafe {
+                bpf_program__set_autoload(
+                    skel.progs
+                        .kprobe_nvidia_poll
+                        .as_libbpf_object()
+                        .as_ptr(),
+                    false,
+                );
+               
+                    bpf_program__set_autoload(
+                        skel.progs
+                            .kprobe_nvidia_open
+                            .as_libbpf_object()
+                            .as_ptr(),
+                        false,
+                    );
+            
+                    bpf_program__set_autoload(
+                        skel.progs
+                            .kprobe_nvidia_mmap
+                            .as_libbpf_object()
+                            .as_ptr(),
+                        false,
+                    );
+                }
+        }
 
         // Load the BPF program for validation.
         let mut skel = scx_ops_load!(skel, bpfland_ops, uei)?;
 
-        // Disable kprobe autoload if GPU support is not enabled
-        if !opts.enable_gpu_support {
-            unsafe {
-                bpf_program__set_autoload(skel.progs.kprobe_nvidia_poll.as_libbpf_object().as_ptr(), false);
-                bpf_program__set_autoload(skel.progs.kprobe_nvidia_open.as_libbpf_object().as_ptr(), false);
-                bpf_program__set_autoload(skel.progs.kprobe_nvidia_mmap.as_libbpf_object().as_ptr(), false);
-            }
-        }
 
         // Initialize the primary scheduling domain and the preferred domain.
         let power_profile = Self::power_profile();
@@ -471,11 +511,6 @@ impl<'a> Scheduler<'a> {
 
         // Attach the scheduler.
         let struct_ops = Some(scx_ops_attach!(skel, bpfland_ops)?);
-        
-        // Conditionally attach GPU kprobes if GPU support is enabled
-        if opts.enable_gpu_support {
-            Self::attach_gpu_kprobes(&mut skel)?;
-        }
         
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
 
@@ -575,10 +610,27 @@ impl<'a> Scheduler<'a> {
             warn!("failed to reset big domain: error {}", err);
         }
         
-        // Update big CPU domain.
         for cpu in big_cpus {
             if let Err(err) = Self::enable_cpu(skel, cpu as i32, MASK_TYPE_BIG) {
                 warn!("failed to add CPU {} to big domain: error {}", cpu, err);
+            }
+        }
+
+        // Also add big CPUs with turbo capability to the turbo cpumask
+        let turbo_cpus = get_turbo_cpus()?;
+        println!("Turbo CPUs: {:?}", turbo_cpus);
+        if !turbo_cpus.is_empty() {
+            info!("Big cores with turbo capability detected: {:?}", turbo_cpus);
+            
+            // Clear the turbo domain by passing a negative CPU id.
+            if let Err(err) = Self::enable_cpu(skel, -1, MASK_TYPE_TURBO) {
+                warn!("failed to reset turbo domain: error {}", err);
+            }
+            
+            for cpu in turbo_cpus {
+                if let Err(err) = Self::enable_cpu(skel, cpu as i32, MASK_TYPE_TURBO) {
+                    warn!("failed to add CPU {} to turbo domain: error {}", cpu, err);
+                }
             }
         }
 
@@ -600,58 +652,12 @@ impl<'a> Scheduler<'a> {
             warn!("failed to reset little domain: error {}", err);
         }
         
-        // Update little CPU domain.
         for cpu in little_cpus {
             if let Err(err) = Self::enable_cpu(skel, cpu as i32, MASK_TYPE_LITTLE) {
                 warn!("failed to add CPU {} to little domain: error {}", cpu, err);
             }
         }
 
-        Ok(())
-    }
-
-    fn attach_gpu_kprobes(skel: &mut BpfSkel<'_>) -> Result<()> {
-        use libbpf_rs::Link;
-        use std::collections::HashMap;
-        
-        // Store kprobe links to keep them alive
-        let mut kprobe_links: HashMap<String, Link> = HashMap::new();
-        
-        // List of kprobes to attach for GPU detection
-        let kprobes = vec![
-            ("nvidia_poll", "nvidia_poll"),
-            ("nvidia_open", "nvidia_open"), 
-            ("nvidia_mmap", "nvidia_mmap"),
-        ];
-        
-        for (prog_name, kprobe_name) in kprobes {
-            let prog = match prog_name {
-                "nvidia_poll" => &skel.progs.kprobe_nvidia_poll,
-                "nvidia_open" => &skel.progs.kprobe_nvidia_open,
-                "nvidia_mmap" => &skel.progs.kprobe_nvidia_mmap,
-                _ => {
-                    warn!("Unknown kprobe program: {}", prog_name);
-                    continue;
-                }
-            };
-            
-            match prog.attach_kprobe(false, kprobe_name) {
-                Ok(link) => {
-                    info!("Successfully attached kprobe {} -> {}", prog_name, kprobe_name);
-                    kprobe_links.insert(prog_name.to_string(), link);
-                }
-                Err(e) => {
-                    warn!("Failed to attach kprobe {} -> {}: {}", prog_name, kprobe_name, e);
-                }
-            }
-        }
-        
-        if !kprobe_links.is_empty() {
-            info!("Attached {} GPU kprobes", kprobe_links.len());
-        } else {
-            warn!("No GPU kprobes were successfully attached");
-        }
-        
         Ok(())
     }
 
