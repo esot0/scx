@@ -240,6 +240,14 @@ struct Opts {
     #[clap(short = 'k', long, action = clap::ArgAction::SetTrue)]
     local_kthreads: bool,
 
+    /// Keep tasks on CPUs where kthreads are running (EXPERIMENTAL).
+    ///
+    /// When enabled, tasks will tend to stay on CPUs that currently have active kernel threads
+    /// instead of migrating to other CPUs. This can help with cache locality and reduce
+    /// context switching overhead in kthread-heavy workloads.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    stay_with_kthread: bool,
+
     /// Disable direct dispatch during synchronous wakeups.
     ///
     /// Enabling this option can lead to a more uniform load distribution across available cores,
@@ -441,6 +449,7 @@ impl<'a> Scheduler<'a> {
         // Implicitly enable direct dispatch of per-CPU kthreads if CPU throttling is enabled
         // (it's never a good idea to throttle per-CPU kthreads).
         skel.maps.rodata_data.local_kthreads = opts.local_kthreads || opts.throttle_us > 0;
+        skel.maps.rodata_data.stay_with_kthread = opts.stay_with_kthread;
 
         // Set scheduler flags.
         skel.struct_ops.bpfland_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING

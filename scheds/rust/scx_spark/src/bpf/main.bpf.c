@@ -83,6 +83,11 @@ const volatile bool enable_gpu_support = false;
 const volatile bool aggressive_gpu_tasks = false;
 
 /*
+ * Stay with kthread: tasks stay on CPUs where kthreads are running. TODO: Make this more fine-grained. We don't want to stick with all kthreads. C
+ */
+const volatile bool stay_with_kthread = false;
+
+/*
  * Scheduling statistics.
  */
 volatile u64 nr_kthread_dispatches, nr_direct_dispatches, nr_shared_dispatches;
@@ -237,6 +242,7 @@ struct cpu_ctx {
 	u64 last_running;
 	u64 perf_lvl;
 	struct bpf_cpumask __kptr *l3_cpumask;
+	bool has_active_kthread;
 };
 
 struct {
@@ -883,14 +889,14 @@ static s32 pick_idle_cpu_gpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags
 {
 	const struct cpumask *big_mask;
 	const struct cpumask *turbo_mask;
-	s32 cpu = -1;
+	s32 cpu = -1; //If no idle CPU is found, go down the regular path for finding an idle CPU
 
 	big_mask = cast_mask(big_cpumask);
 	turbo_mask = cast_mask(turbo_cpumask);
 	if (big_mask && bpf_cpumask_empty(big_mask)){
 		big_mask = NULL;
 		turbo_mask = NULL;
-		return prev_cpu;
+		return cpu;
 	}
 
 	if(turbo_mask && bpf_cpumask_empty(turbo_mask)){
@@ -900,6 +906,12 @@ static s32 pick_idle_cpu_gpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags
 
 /*Try looking for idle turbo CPUs, even if it's not a cache sibling. NOTE: This will probably happen dynamically based on cache sensitivity when workload detection improves.*/
 if(turbo_mask){
+    //Check if the previous CPU is idle and in the turbo mask
+	if (bpf_cpumask_test_cpu(prev_cpu, turbo_mask) && scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+		*is_idle = true;
+		return prev_cpu;
+	}
+//Select any turbo CPU :
 	cpu = find_idle_cpu_in_mask(turbo_mask, 0);
 	if(cpu >= 0){
 		*is_idle = true;
@@ -919,10 +931,11 @@ if(turbo_mask){
 		cpu = find_idle_cpu_in_mask(big_mask, 0);
 		if(cpu >= 0){
 			*is_idle = true;
+			return cpu;
 		}
 	}
 
-	return cpu >= 0 ? cpu : prev_cpu;
+	return cpu;
 }
 
 static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bool *is_idle)
@@ -940,13 +953,16 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bo
 	is_gpu_task = tctx->is_gpu_task;
 
 	if(aggressive_gpu_tasks){
+		
 		if(is_gpu_task){
+			bpf_printk("Aggressive gpu task: %s", p->comm);
 			cpu = pick_idle_cpu_gpu(p, prev_cpu, wake_flags, is_idle);
 			if(cpu >= 0){
 				return cpu;
 			}
 		}
 		else{
+			bpf_printk("Not a gpu task: %s", p->comm);
 			little_mask = cast_mask(little_cpumask);
 			if (little_mask && bpf_cpumask_empty(little_mask)){
 				little_mask = NULL;
@@ -955,7 +971,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bo
 			/*
 	 * Try to re-use the same CPU if it's a little CPU.
 	 */
-	if (little_mask && bpf_cpumask_test_cpu(prev_cpu, little_mask)) {
+	if (little_mask && bpf_cpumask_test_cpu(prev_cpu, little_mask) && scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
 		cpu = prev_cpu;
 		*is_idle = true;
 		goto out_put_cpumask;
@@ -1106,13 +1122,21 @@ static bool can_direct_dispatch(s32 cpu)
  * dispatched directly to the CPU returned by this callback.
  */
 s32 BPF_STRUCT_OPS(bpfland_select_cpu, struct task_struct *p,
-			s32 prev_cpu, u64 wake_flags)
+		s32 prev_cpu, u64 wake_flags)
 {
 	bool is_idle = false;
 	s32 cpu;
 
 	if (is_throttled())
 		return prev_cpu;
+
+	/* If stay_with_kthread is enabled, check if prev_cpu has an active kthread */
+	if (stay_with_kthread) {
+		struct cpu_ctx *cctx = try_lookup_cpu_ctx(prev_cpu);
+		if (cctx && cctx->has_active_kthread) {
+			return prev_cpu;
+		}
+	}
 
 	cpu = pick_idle_cpu(p, prev_cpu, wake_flags, &is_idle);
 	if (is_idle) {
@@ -1171,6 +1195,7 @@ static bool kick_idle_cpu(const struct task_struct *p, const struct task_ctx *tc
 static bool try_direct_dispatch(struct task_struct *p, struct task_ctx *tctx,
 				s32 prev_cpu, u64 slice, u64 enq_flags)
 {
+
 	/*
 	 * If a task has been re-enqueued because its assigned CPU has been
 	 * taken by a higher priority scheduling class, force it to follow
@@ -1236,7 +1261,7 @@ static bool try_direct_dispatch(struct task_struct *p, struct task_ctx *tctx,
 
 			/*
 			 * No need to check for other CPUs if the task can
-			 * only run on a single one.
+			 * only run on a singe one.
 			 */
 			return false;
 		}
@@ -1283,6 +1308,7 @@ void BPF_STRUCT_OPS(bpfland_enqueue, struct task_struct *p, u64 enq_flags)
 	tctx = try_lookup_task_ctx(p);
 	if (!tctx)
 		return;
+
 	deadline = task_deadline(p, tctx);
 	slice = CLAMP(slice_max / nr_tasks_waiting(prev_cpu), slice_min, slice_max);
 
@@ -1350,7 +1376,7 @@ void BPF_STRUCT_OPS(bpfland_dispatch, s32 cpu, struct task_struct *prev)
 	 * Consume regular tasks from the appropriate DSQ, transferring them to the
 	 * local CPU DSQ.
 	 */
-	if (scx_bpf_dsq_move_to_local(dsq_id)) 
+	if (scx_bpf_dsq_move_to_local(dsq_id))
 		return;
 
 	if (prev && keep_running(prev, cpu))
@@ -1440,8 +1466,17 @@ void BPF_STRUCT_OPS(bpfland_running, struct task_struct *p)
 {
 	struct task_ctx *tctx;
 	u64 now = scx_bpf_now();
+	s32 cpu = scx_bpf_task_cpu(p);
 
 	__sync_fetch_and_add(&nr_running, 1);
+
+	/* If stay_with_kthread is enabled, track kthread activity */
+	if (stay_with_kthread && is_kthread(p)) {
+		struct cpu_ctx *cctx = try_lookup_cpu_ctx(cpu);
+		if (cctx) {
+			cctx->has_active_kthread = true;
+		}
+	}
 
 	tctx = try_lookup_task_ctx(p);
 	if (!tctx)
@@ -1480,6 +1515,14 @@ void BPF_STRUCT_OPS(bpfland_stopping, struct task_struct *p, bool runnable)
 	struct task_ctx *tctx;
 
 	__sync_fetch_and_sub(&nr_running, 1);
+
+	/* If stay_with_kthread is enabled, reset kthread activity flag */
+	if (stay_with_kthread && is_kthread(p)) {
+		cctx = try_lookup_cpu_ctx(cpu);
+		if (cctx) {
+			cctx->has_active_kthread = false; //Maayybee racey? 
+		}
+	}
 
 	tctx = try_lookup_task_ctx(p);
 	if (!tctx)
