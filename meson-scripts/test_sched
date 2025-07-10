@@ -41,6 +41,8 @@ else
     SCHEDS["scx_rustland"]="-v"
     SCHEDS["scx_bpfland"]="-v"
     SCHEDS["scx_layered"]="-v --run-example"
+    SCHEDS["scx_flashyspark"]="-v"
+    SCHEDS["scx_spark"]="-v"
 fi
 
 if [[ -v SCHEDS["scx_layered"] ]] ; then

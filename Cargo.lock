@@ -2833,6 +2833,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "scx_flashyspark"
+version = "1.0.11"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crossbeam",
+ "ctrlc",
+ "libbpf-rs",
+ "log",
+ "scx_stats",
+ "scx_stats_derive",
+ "scx_utils",
+ "serde",
+ "simplelog",
+]
+
+[[package]]
 name = "scx_lavd"
 version = "1.0.14"
 dependencies = [
@@ -3034,6 +3051,23 @@ dependencies = [
  "simplelog",
  "sorted-vec",
  "static_assertions",
+]
+
+[[package]]
+name = "scx_spark"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crossbeam",
+ "ctrlc",
+ "libbpf-rs",
+ "log",
+ "scx_stats",
+ "scx_stats_derive",
+ "scx_utils",
+ "serde",
+ "simplelog",
 ]
 
 [[package]]
