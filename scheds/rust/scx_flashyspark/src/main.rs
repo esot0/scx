@@ -364,6 +364,15 @@ struct Opts {
     #[clap(short = 'H', long, action = clap::ArgAction::SetTrue)]
     stay_with_kthread: bool,
 
+    /// Keep tasks on CPUs where short exec_runtime tasks are running (EXPERIMENTAL).
+    ///
+    /// When enabled, tasks will tend to stay on CPUs that currently have active short exec_runtime
+    /// tasks instead of migrating to other CPUs. This can help with cache locality and reduce
+    /// context switching overhead in workloads with tasks that sleep often.
+    #[clap(short = 'E', long, action = clap::ArgAction::SetTrue)]
+    stay_with_short_exec_runtime: bool,
+
+
     /// Native tasks priorities.
     ///
     /// By default, the scheduler normalizes task priorities to avoid large gaps that could lead to
@@ -466,6 +475,10 @@ struct Opts {
     //Kick using a bpf timer instead of scx_kick_cpu
     #[clap(short = 'K', long, action = clap::ArgAction::SetTrue)]
     timer_kick: bool,
+
+    //Use multiple DSQs to prioritize certain tasks on certain cores
+    #[clap(short = 'M', long, action = clap::ArgAction::SetTrue)]
+    more_dsqs: bool,
 
     /// Show descriptions for statistics.
     #[clap(long)]
@@ -589,7 +602,9 @@ impl<'a> Scheduler<'a> {
         skel.maps.rodata_data.aggressive_gpu_tasks = opts.aggressive_gpu_tasks;
         skel.maps.rodata_data.workload_aware_scheduling = opts.workload_aware_scheduling;
         skel.maps.rodata_data.stay_with_kthread = opts.stay_with_kthread;
+        skel.maps.rodata_data.stay_with_short_exec_runtime = opts.stay_with_short_exec_runtime;
         skel.maps.rodata_data.timer_kick = opts.timer_kick;
+        skel.maps.rodata_data.more_dsqs = opts.more_dsqs;
 
         // Normalize CPU busy threshold in the range [0 .. 1024].
         skel.maps.rodata_data.cpu_busy_thresh = if opts.cpu_busy_thresh < 0 {
