@@ -381,6 +381,128 @@ struct {
 } perf_request_queue SEC(".maps");
 
 /*
+ * Optimized scheduler parameters for each workload type.
+ * Populated by userspace from ML optimization results.
+ */
+struct optimized_params {
+    /* Boolean parameters */
+    bool sticky_cpu;
+    bool direct_dispatch;
+    bool aggressive_gpu_tasks;
+    bool local_pcpu;
+    bool no_wake_sync;
+    bool slice_lag_scaling;
+    bool local_kthreads;
+    bool stay_with_kthread;
+    bool native_priority;
+    bool tickless_sched;
+    bool timer_kick;
+    
+    /* Time slice parameters (in microseconds) */
+    u64 slice_us;           /* Base time slice */
+    u64 slice_us_min;       /* Minimum time slice */
+    u64 slice_us_lag;       /* Sleep budget */
+    u64 run_us_lag;         /* Runtime penalty budget */
+    
+    /* Other numeric parameters */
+    s64 cpu_busy_thresh;    /* CPU utilization threshold (-1 for auto, 0-1024) */
+    u64 max_avg_nvcsw;      /* Max voluntary context switches */
+    
+    bool is_configured;     /* Whether this workload has optimized params */
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, MAX_WORKLOAD_TYPES);
+    __type(key, u32);
+    __type(value, struct optimized_params);
+} workload_params SEC(".maps");
+
+/*
+ * Runtime overrides for const volatile parameters.
+ * When a workload has ML-optimized parameters, these override the const values.
+ */
+volatile bool use_ml_params = false;
+
+/* Boolean ML parameters */
+volatile bool ml_local_pcpu = false;
+volatile bool ml_no_wake_sync = false;
+volatile bool ml_slice_lag_scaling = false;
+volatile bool ml_local_kthreads = false;
+volatile bool ml_stay_with_kthread = false;
+volatile bool ml_native_priority = false;
+volatile bool ml_tickless_sched = false;
+volatile bool ml_timer_kick = false;
+
+/* Numeric ML parameters */
+volatile u64 ml_slice_max = 4096ULL * NSEC_PER_USEC;
+volatile u64 ml_slice_min = 128ULL * NSEC_PER_USEC;
+volatile u64 ml_slice_lag = 4096ULL * NSEC_PER_USEC;
+volatile u64 ml_run_lag = 32768ULL * NSEC_PER_USEC;
+volatile s64 ml_cpu_busy_thresh = -1LL;
+volatile u64 ml_max_avg_nvcsw = 128ULL;
+
+/*
+ * Helper functions to get effective parameter values.
+ * These return ML-optimized values when available, otherwise const volatile defaults.
+ */
+static inline u64 get_slice_max(void) {
+    return use_ml_params ? ml_slice_max : slice_max;
+}
+
+static inline u64 get_slice_min(void) {
+    return use_ml_params ? ml_slice_min : slice_min;
+}
+
+static inline u64 get_slice_lag(void) {
+    return use_ml_params ? ml_slice_lag : slice_lag;
+}
+
+static inline u64 get_run_lag(void) {
+    return use_ml_params ? ml_run_lag : run_lag;
+}
+
+static inline s64 get_cpu_busy_thresh(void) {
+    return use_ml_params ? ml_cpu_busy_thresh : cpu_busy_thresh;
+}
+
+static inline u64 get_max_avg_nvcsw(void) {
+    return use_ml_params ? ml_max_avg_nvcsw : max_avg_nvcsw;
+}
+
+static inline bool get_local_pcpu(void) {
+    return use_ml_params ? ml_local_pcpu : local_pcpu;
+}
+
+static inline bool get_no_wake_sync(void) {
+    return use_ml_params ? ml_no_wake_sync : no_wake_sync;
+}
+
+static inline bool get_slice_lag_scaling(void) {
+    return use_ml_params ? ml_slice_lag_scaling : slice_lag_scaling;
+}
+
+static inline bool get_local_kthreads(void) {
+    return use_ml_params ? ml_local_kthreads : local_kthreads;
+}
+
+static inline bool get_stay_with_kthread(void) {
+    return use_ml_params ? ml_stay_with_kthread : stay_with_kthread;
+}
+
+static inline bool get_native_priority(void) {
+    return use_ml_params ? ml_native_priority : native_priority;
+}
+
+static inline bool get_tickless_sched(void) {
+    return use_ml_params ? ml_tickless_sched : tickless_sched;
+}
+
+static inline bool get_timer_kick(void) {
+    return use_ml_params ? ml_timer_kick : timer_kick;
+}
+
+/*
  * Per-node context.
  */
 struct node_ctx {
@@ -618,15 +740,15 @@ static u32 classify_stage1_lightweight(struct task_ctx *tctx) {
     /* Score each workload type based on lightweight metrics */
     
     /* LATENCY_SENSITIVE: High nvcsw, short runtime */
-    if (nvcsw_rate > 100 && avg_runtime < slice_max / 4) {
+    if (nvcsw_rate > 100 && avg_runtime < get_slice_max() / 4) {
         m->confidence_scores[WORKLOAD_TYPE_LATENCY_SENSITIVE] = 
             MIN(85, 50 + (nvcsw_rate / 10));
     }
     
     /* CPU_INTENSIVE: Low nvcsw, long runtime */
-    if (nvcsw_rate < 20 && avg_runtime > slice_max / 2) {
+    if (nvcsw_rate < 20 && avg_runtime > get_slice_max() / 2) {
         m->confidence_scores[WORKLOAD_TYPE_CPU_INTENSIVE] = 
-            MIN(85, 50 + (avg_runtime * 40 / slice_max));
+            MIN(85, 50 + (avg_runtime * 40 / get_slice_max()));
     }
     
 
@@ -654,7 +776,7 @@ static u32 classify_stage1_lightweight(struct task_ctx *tctx) {
     }
     
     /* Medium runtime + medium nvcsw could be cache-sensitive */
-    if (avg_runtime > slice_max / 8 && avg_runtime < slice_max / 2 &&
+    if (avg_runtime > get_slice_max() / 8 && avg_runtime < get_slice_max() / 2 &&
         nvcsw_rate > 30 && nvcsw_rate < 80) {
         m->needs_detailed_analysis = 1;
     }
@@ -747,7 +869,8 @@ static void classify_stage2_detailed(struct task_ctx *tctx) {
     }
     
     /* We've done detailed analysis, can disable perf monitoring now */
-    if (m->confidence_scores[tctx->workload_info.current_type] >= CONFIDENCE_THRESHOLD) {
+    if (tctx->workload_info.current_type < MAX_WORKLOAD_TYPES &&
+        m->confidence_scores[tctx->workload_info.current_type] >= CONFIDENCE_THRESHOLD) {
         m->perf_mon_state = PERF_MON_DISABLED;
         m->needs_detailed_analysis = 0;
     }
@@ -895,8 +1018,9 @@ static void classify_task_incremental(struct task_struct *p, struct task_ctx *tc
             break;
         }
         
-        __sync_fetch_and_add(&global_policy.workload_counts[new_type], 1);
-        if (wi->previous_type != WORKLOAD_TYPE_UNKNOWN)
+        if (new_type < MAX_WORKLOAD_TYPES)
+            __sync_fetch_and_add(&global_policy.workload_counts[new_type], 1);
+        if (wi->previous_type != WORKLOAD_TYPE_UNKNOWN && wi->previous_type < MAX_WORKLOAD_TYPES)
             __sync_fetch_and_sub(&global_policy.workload_counts[wi->previous_type], 1);
             
         dbg_msg("Task %d classified as %u with confidence %u%% (perf: %s)",
@@ -1040,9 +1164,9 @@ static inline u64 task_slice(s32 cpu) {
     u64 nr_wait = nr_tasks_waiting(cpu);
 
     if (!nr_wait)
-        return tickless_sched ? SCX_SLICE_INF : slice_max;
+        return get_tickless_sched() ? SCX_SLICE_INF : get_slice_max();
 
-    return MAX(slice_max / nr_wait, slice_min);
+    return MAX(get_slice_max() / nr_wait, get_slice_min());
 }
 
 /*
@@ -1063,8 +1187,8 @@ static inline u64 task_weight(const struct task_struct *p) {
      * Return the non-normalized task weight if @native_priority is
      * enabled.
      */
-    if (native_priority)
-return p->scx.weight;
+    if (get_native_priority())
+        return p->scx.weight;
 
     return 1 + (127 * log2_u64(p->scx.weight) / log2_u64(10000));
 }
@@ -1072,7 +1196,7 @@ return p->scx.weight;
 /*
  * Return the default task weight.
  */
-static inline u64 task_base_weight(void) { return native_priority ? 100 : 64; }
+static inline u64 task_base_weight(void) { return get_native_priority() ? 100 : 64; }
 
 /*
  * Scale a value proportional to the task's normalized weight.
@@ -1106,7 +1230,7 @@ static void update_task_deadline(struct task_struct *p, struct task_ctx *tctx) {
      * budget, a task that is sleeping frequently will get a bigger
      * time budget.
      */
-    lag_scale = max_avg_nvcsw ? log2_u64(MAX(tctx->avg_nvcsw, 2)) : 1;
+    lag_scale = get_max_avg_nvcsw() ? log2_u64(MAX(tctx->avg_nvcsw, 2)) : 1;
 
     /*
      * Adjust the budget in function of the average user CPU
@@ -1125,7 +1249,7 @@ static void update_task_deadline(struct task_struct *p, struct task_ctx *tctx) {
      * This ensures that isolated bursty workloads are prioritized for
      * performance, while mixed workloads remain responsive and balanced.
      */
-    if (slice_lag_scaling)
+    if (get_slice_lag_scaling())
         lag_scale = lag_scale * cpu_util / SCX_CPUPERF_ONE;
 
     /*
@@ -1139,7 +1263,7 @@ static void update_task_deadline(struct task_struct *p, struct task_ctx *tctx) {
      * long sleeps, treating short and long sleeps equally once they
      * exceed the threshold.
      */
-    max_sleep = scale_by_task_normalized_weight(p, slice_lag * lag_scale);
+    max_sleep = scale_by_task_normalized_weight(p, get_slice_lag() * lag_scale);
     vtime_min = vtime_now > max_sleep ? vtime_now - max_sleep : 0;
     if (time_before(p->scx.dsq_vtime, vtime_min))
         p->scx.dsq_vtime = vtime_min;
@@ -1165,7 +1289,7 @@ static int wakeup_timerfn(void *map, int *key, struct bpf_timer *timer) {
     bpf_for(cpu, 0, nr_cpu_ids) if (scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu))
         scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 
-    err = bpf_timer_start(timer, slice_max, 0);
+    err = bpf_timer_start(timer, get_slice_max(), 0);
     if (err)
         scx_bpf_error("Failed to re-arm duty cycle timer");
 
@@ -1302,7 +1426,7 @@ static bool is_llc_busy(s32 cpu) {
  */
 static bool is_wake_sync(const struct task_struct *current, s32 prev_cpu, s32 this_cpu,
                          u64 wake_flags) {
-    if (no_wake_sync)
+    if (get_no_wake_sync())
         return false;
 
     return (wake_flags & SCX_WAKE_SYNC) && !(current->flags & PF_EXITING);
@@ -1881,8 +2005,8 @@ s32 BPF_STRUCT_OPS(flashyspark_select_cpu, struct task_struct *p, s32 prev_cpu, 
      * kthreads tend to be quite short-lived, so cache-sensitive tasks might
      * benefit from simply waiting for them to complete.
      */
-    if (stay_with_kthread || stay_with_short_exec_runtime) {
-        if(stay_with_kthread && cctx && cctx->has_active_kthread) {
+    if (get_stay_with_kthread() || stay_with_short_exec_runtime) {
+        if(get_stay_with_kthread() && cctx && cctx->has_active_kthread) {
 		cctx->has_active_kthread = false;
 		dbg_msg("spark_select_cpu: Previous task is a per-CPU kthread, inserting "
 			"into Local DSQ. Task: %s",
@@ -1894,7 +2018,7 @@ s32 BPF_STRUCT_OPS(flashyspark_select_cpu, struct task_struct *p, s32 prev_cpu, 
 			"into Local DSQ. Task: %s",
 			p->comm);
 	}
-        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_max, 0);
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, get_slice_max(), 0);
         __sync_fetch_and_add(&nr_direct_dispatches, 1);
         return prev_cpu;
     }
@@ -1920,7 +2044,7 @@ static bool kick_idle_cpu(const struct task_struct *p, const struct task_ctx *tc
     s32 cpu = scx_bpf_task_cpu(p);
     int node = __COMPAT_scx_bpf_cpu_node(cpu);
 
-    if (timer_kick)
+    if (get_timer_kick())
         return false;
     
     if (is_throttled())
@@ -1986,7 +2110,7 @@ static bool is_cpu_busy(s32 cpu) {
      * stickiness to improve cache locality while still preserving work
      * conservation, since the system isn't overloaded.
      */
-    u64 cpu_thresh = cpu_busy_thresh >= 0 ? cpu_busy_thresh : (SCX_CPUPERF_ONE - cpu_util);
+    u64 cpu_thresh = get_cpu_busy_thresh() >= 0 ? get_cpu_busy_thresh() : (SCX_CPUPERF_ONE - cpu_util);
 
     /*
      * If the target threshold is greater than 100% assume the CPU is
@@ -2024,8 +2148,8 @@ static bool try_direct_dispatch(struct task_struct *p, struct task_ctx *tctx, s3
      * potentially stall the entire system if they are blocked (i.e.,
      * ksoftirqd/N, rcuop/N, etc.).
      */
-    if (local_kthreads && is_kthread(p) && p->nr_cpus_allowed == 1) {
-        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | prev_cpu, slice_max, enq_flags);
+    if (get_local_kthreads() && is_kthread(p) && p->nr_cpus_allowed == 1) {
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | prev_cpu, get_slice_max(), enq_flags);
         __sync_fetch_and_add(&nr_kthread_dispatches, 1);
         dispatched = true;
 
@@ -2121,7 +2245,7 @@ out_kick:
  * Return true if the @p can be enqueued to the @cpu DSQ, false otherwise.
  */
 static bool can_enqueue_to_cpu(const struct task_struct *p, s32 cpu) {
-    if (local_pcpu && is_pcpu_task(p))
+    if (get_local_pcpu() && is_pcpu_task(p))
         return true;
 
     return !is_cpu_busy(cpu);
@@ -2135,7 +2259,7 @@ static bool can_enqueue_to_cpu(const struct task_struct *p, s32 cpu) {
 static void preempt_curr(s32 cpu) {
     struct task_struct *curr;
 
-    if (!tickless_sched)
+    if (!get_tickless_sched())
         return;
 
     bpf_rcu_read_lock();
@@ -2159,13 +2283,13 @@ static void rr_enqueue(struct task_struct *p, struct task_ctx *tctx, s32 prev_cp
      */
     if (!scx_bpf_task_running(p) || (enq_flags & SCX_ENQ_REENQ)) {
         if (is_pcpu_task(p)) {
-            if (!timer_kick && scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+            if (!get_timer_kick() && scx_bpf_test_and_clear_cpu_idle(prev_cpu))
                 scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
         } else {
             cpu = pick_idle_cpu(p, tctx, prev_cpu, 0, &is_idle);
             if (is_idle) {
                 scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, task_slice(cpu), enq_flags);
-                if (!timer_kick)
+                if (!get_timer_kick())
                     scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
                 return;
             }
@@ -2222,7 +2346,7 @@ void BPF_STRUCT_OPS(flashyspark_enqueue, struct task_struct *p, u64 enq_flags) {
         return;
 
     cctx = try_lookup_cpu_ctx(prev_cpu);
-    if (stay_with_kthread && cctx) {
+    if (get_stay_with_kthread() && cctx) {
         /* This won't always necessarily be the thread preempted by a kthread, may
          * need to modify logic. Consider the case where a task T1 sleeps, then
          * another task, T2, runs on the same CPU. Then, a per-cpu kthread T3
@@ -2331,7 +2455,9 @@ workload_statistics:
         }
     }
     
-    __sync_fetch_and_add(&nr_workload_dispatches[tctx->workload_info.current_type], 1);
+    /* Bounds check to ensure we don't access out of bounds */
+    if (tctx->workload_info.current_type < MAX_WORKLOAD_TYPES)
+        __sync_fetch_and_add(&nr_workload_dispatches[tctx->workload_info.current_type], 1);
 }
 
 /*
@@ -2556,7 +2682,7 @@ void BPF_STRUCT_OPS(flashyspark_running, struct task_struct *p) {
         }
     }
 
-    if(stay_with_kthread && is_kthread(p)) {
+    if(get_stay_with_kthread() && is_kthread(p)) {
         cctx = try_lookup_cpu_ctx(scx_bpf_task_cpu(p));
         if(cctx) {
             cctx->has_active_kthread = true;
@@ -2606,7 +2732,8 @@ void BPF_STRUCT_OPS(flashyspark_stopping, struct task_struct *p, bool runnable) 
         calc_avg(tctx->workload_info.metrics.avg_runtime_per_slice, slice);
     
     /* Update global CPU time tracking for workload type */
-    __sync_fetch_and_add(&global_policy.workload_cpu_time[tctx->workload_info.current_type], slice);
+    if (tctx->workload_info.current_type < MAX_WORKLOAD_TYPES)
+        __sync_fetch_and_add(&global_policy.workload_cpu_time[tctx->workload_info.current_type], slice);
 
     if (!rr_sched) {
         /*
@@ -2615,7 +2742,7 @@ void BPF_STRUCT_OPS(flashyspark_stopping, struct task_struct *p, bool runnable) 
          * de-prioritization of CPU-intensive tasks (which could
          * lead to starvation).
          */
-        tctx->exec_runtime = MIN(tctx->exec_runtime + slice, run_lag);
+        tctx->exec_runtime = MIN(tctx->exec_runtime + slice, get_run_lag());
 
         /*
          * Update task's vruntime.
@@ -2666,7 +2793,7 @@ void BPF_STRUCT_OPS(flashyspark_quiescent, struct task_struct *p, u64 deq_flags)
             tctx->workload_info.metrics.wakeup_count++;
     }
 
-    if (rr_sched || !max_avg_nvcsw)
+    if (rr_sched || !get_max_avg_nvcsw())
         return;
 
     /*
@@ -2680,9 +2807,9 @@ void BPF_STRUCT_OPS(flashyspark_quiescent, struct task_struct *p, u64 deq_flags)
      */
     delta_t = time_delta(now, tctx->last_sleep_at);
     if (delta_t > 0) {
-        u64 nvcsw = slice_max / delta_t;
+        u64 nvcsw = get_slice_max() / delta_t;
 
-        tctx->avg_nvcsw = calc_avg_clamp(tctx->avg_nvcsw, nvcsw, 0, max_avg_nvcsw);
+        tctx->avg_nvcsw = calc_avg_clamp(tctx->avg_nvcsw, nvcsw, 0, get_max_avg_nvcsw());
     }
 }
 
@@ -3197,19 +3324,58 @@ static int policy_timerfn(void *map, int *key, struct bpf_timer *timer) {
                 global_policy.policy_lock_until = now + 30ULL * NSEC_PER_SEC;
                 
                 /* Revert scheduler parameters based on previous policy */
-                switch (global_policy.current_policy) {
-                case WORKLOAD_TYPE_CACHE_SENSITIVE:
-                    sticky_cpu = true;
-                    break;
-                case WORKLOAD_TYPE_GPU_INTENSIVE:
-                    aggressive_gpu_tasks = true;
-                    break;
-                default:
-                    /* Reset to defaults */
-                    sticky_cpu = false;
-                    aggressive_gpu_tasks = false;
-                    direct_dispatch = false;
-                    break;
+                struct optimized_params *prev_params = bpf_map_lookup_elem(&workload_params, &global_policy.current_policy);
+                if (prev_params && prev_params->is_configured) {
+                    /* Use ML-optimized parameters for previous policy - apply ALL of them */
+                    use_ml_params = true;
+                    
+                    /* Apply all boolean parameters */
+                    sticky_cpu = prev_params->sticky_cpu;
+                    direct_dispatch = prev_params->direct_dispatch;
+                    aggressive_gpu_tasks = prev_params->aggressive_gpu_tasks;
+                    ml_local_pcpu = prev_params->local_pcpu;
+                    ml_no_wake_sync = prev_params->no_wake_sync;
+                    ml_slice_lag_scaling = prev_params->slice_lag_scaling;
+                    ml_local_kthreads = prev_params->local_kthreads;
+                    ml_stay_with_kthread = prev_params->stay_with_kthread;
+                    ml_native_priority = prev_params->native_priority;
+                    ml_tickless_sched = prev_params->tickless_sched;
+                    ml_timer_kick = prev_params->timer_kick;
+                    
+                    /* Apply all numeric parameters */
+                    ml_slice_max = prev_params->slice_us * NSEC_PER_USEC;
+                    ml_slice_min = prev_params->slice_us_min * NSEC_PER_USEC;
+                    ml_slice_lag = prev_params->slice_us_lag * NSEC_PER_USEC;
+                    ml_run_lag = prev_params->run_us_lag * NSEC_PER_USEC;
+                    ml_cpu_busy_thresh = prev_params->cpu_busy_thresh;
+                    ml_max_avg_nvcsw = prev_params->max_avg_nvcsw;
+                } else {
+                    /* Fallback to default for previous policy */
+                    use_ml_params = false;  /* Use const volatile defaults */
+                    
+                    switch (global_policy.current_policy) {
+                    case WORKLOAD_TYPE_CACHE_SENSITIVE:
+                        sticky_cpu = true;
+                        direct_dispatch = false;
+                        aggressive_gpu_tasks = false;
+                        break;
+                    case WORKLOAD_TYPE_GPU_INTENSIVE:
+                        sticky_cpu = false;
+                        direct_dispatch = true;
+                        aggressive_gpu_tasks = true;
+                        break;
+                    case WORKLOAD_TYPE_CPU_INTENSIVE:
+                        sticky_cpu = false;
+                        direct_dispatch = true;
+                        aggressive_gpu_tasks = false;
+                        break;
+                    default:
+                        /* Reset to defaults */
+                        sticky_cpu = false;
+                        aggressive_gpu_tasks = false;
+                        direct_dispatch = false;
+                        break;
+                    }
                 }
             }
             
@@ -3278,37 +3444,73 @@ static int policy_timerfn(void *map, int *key, struct bpf_timer *timer) {
                 global_policy.validation_start_time = now;
                 
                 /* Apply policy-specific scheduler parameters */
-                switch (best_policy) {
-                case WORKLOAD_TYPE_LATENCY_SENSITIVE:
-                    /* Optimize for low latency */
-                    // Note: slice_lag adjustment disabled since it's const volatile
-                    // if (slice_lag_scaling)
-                    //     slice_lag = MIN(slice_lag * 2, 8192ULL * NSEC_PER_USEC);
-                    break;
+                struct optimized_params *params = bpf_map_lookup_elem(&workload_params, &best_policy);
+                if (params && params->is_configured) {
+                    /* Use ML-optimized parameters - apply ALL of them */
+                    use_ml_params = true;
                     
-                case WORKLOAD_TYPE_CPU_INTENSIVE:
-                    /* Optimize for throughput */
-                    // Note: slice_lag adjustment disabled since it's const volatile
-                    // if (slice_lag_scaling)
-                    //     slice_lag = MAX(slice_lag / 2, 2048ULL * NSEC_PER_USEC);
-                    break;
+                    /* Apply all boolean parameters */
+                    sticky_cpu = params->sticky_cpu;
+                    direct_dispatch = params->direct_dispatch;
+                    aggressive_gpu_tasks = params->aggressive_gpu_tasks;
+                    ml_local_pcpu = params->local_pcpu;
+                    ml_no_wake_sync = params->no_wake_sync;
+                    ml_slice_lag_scaling = params->slice_lag_scaling;
+                    ml_local_kthreads = params->local_kthreads;
+                    ml_stay_with_kthread = params->stay_with_kthread;
+                    ml_native_priority = params->native_priority;
+                    ml_tickless_sched = params->tickless_sched;
+                    ml_timer_kick = params->timer_kick;
                     
-                case WORKLOAD_TYPE_CACHE_SENSITIVE:
-                    /* Minimize migrations */
-                    sticky_cpu = true;
-                    break;
+                    /* Apply all numeric parameters */
+                    ml_slice_max = params->slice_us * NSEC_PER_USEC;
+                    ml_slice_min = params->slice_us_min * NSEC_PER_USEC;
+                    ml_slice_lag = params->slice_us_lag * NSEC_PER_USEC;
+                    ml_run_lag = params->run_us_lag * NSEC_PER_USEC;
+                    ml_cpu_busy_thresh = params->cpu_busy_thresh;
+                    ml_max_avg_nvcsw = params->max_avg_nvcsw;
                     
-                case WORKLOAD_TYPE_GPU_INTENSIVE:
-                    /* Ensure GPU tasks get big cores */
-                    aggressive_gpu_tasks = true;
-                    break;
+                    dbg_msg("Applied ALL ML-optimized params for policy %u", best_policy);
+                } else {
+                    /* Fallback to default policy-specific parameters */
+                    use_ml_params = false;  /* Use const volatile defaults */
                     
-                default:
-                    /* Reset to default parameters */
-                    sticky_cpu = false;
-                    aggressive_gpu_tasks = false;
-                    direct_dispatch = false;
-                    break;
+                    switch (best_policy) {
+                    case WORKLOAD_TYPE_LATENCY_SENSITIVE:
+                        /* Optimize for low latency */
+                        sticky_cpu = false;
+                        direct_dispatch = false;
+                        aggressive_gpu_tasks = false;
+                        break;
+                        
+                    case WORKLOAD_TYPE_CPU_INTENSIVE:
+                        /* Optimize for throughput */
+                        sticky_cpu = false;
+                        direct_dispatch = true;
+                        aggressive_gpu_tasks = false;
+                        break;
+                        
+                    case WORKLOAD_TYPE_CACHE_SENSITIVE:
+                        /* Minimize migrations */
+                        sticky_cpu = true;
+                        direct_dispatch = false;
+                        aggressive_gpu_tasks = false;
+                        break;
+                        
+                    case WORKLOAD_TYPE_GPU_INTENSIVE:
+                        /* Ensure GPU tasks get big cores */
+                        sticky_cpu = false;
+                        direct_dispatch = true;
+                        aggressive_gpu_tasks = true;
+                        break;
+                        
+                    default:
+                        /* Reset to default parameters */
+                        sticky_cpu = false;
+                        aggressive_gpu_tasks = false;
+                        direct_dispatch = false;
+                        break;
+                    }
                 }
             }
         }
@@ -3364,7 +3566,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(flashyspark_init) {
         bpf_timer_init(timer, &wakeup_timer, CLOCK_BOOTTIME);
         bpf_timer_set_callback(timer, wakeup_timerfn);
 
-        err = bpf_timer_start(timer, slice_max, 0);
+        err = bpf_timer_start(timer, get_slice_max(), 0);
         if (err) {
             scx_bpf_error("Failed to arm wakeup timer");
             return err;
@@ -3458,7 +3660,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(flashyspark_init) {
     if (throttle_ns) {
         bpf_timer_init(timer, &throttle_timer, CLOCK_BOOTTIME);
         bpf_timer_set_callback(timer, throttle_timerfn);
-        err = bpf_timer_start(timer, slice_max, 0);
+        err = bpf_timer_start(timer, get_slice_max(), 0);
         if (err) {
             scx_bpf_error("Failed to arm throttle timer");
             return err;

@@ -114,7 +114,6 @@ struct classification_metrics {
 	/* Behavior counters */
 	u64 behavior_samples;          /* Total samples collected */
 	u64 wakeup_count;              /* Number of wakeups */
-	u64 io_wait_count;             /* Times task waited for I/O */
 	u64 cpu_migrations;            /* Number of CPU migrations */
 	u64 cache_misses;              /* Estimated cache misses (from migrations) */
 	
@@ -159,6 +158,34 @@ struct workload_info {
 	u8 prefer_big_core;            /* Hint to prefer performance cores */
 	u8 prefer_cache_local;         /* Hint to minimize cache migrations */
 	u8 latency_critical;           /* Hint for latency-critical handling */
+};
+
+/* ML-optimized scheduler parameters for each workload type */
+struct optimized_params {
+	/* Boolean parameters */
+	bool sticky_cpu;
+	bool direct_dispatch;
+	bool aggressive_gpu_tasks;
+	bool local_pcpu;
+	bool no_wake_sync;
+	bool slice_lag_scaling;
+	bool local_kthreads;
+	bool stay_with_kthread;
+	bool native_priority;
+	bool tickless_sched;
+	bool timer_kick;
+	
+	/* Time slice parameters (in microseconds) */
+	u64 slice_us;              /* Base time slice */
+	u64 slice_us_min;          /* Minimum time slice */
+	u64 slice_us_lag;          /* Sleep budget */
+	u64 run_us_lag;            /* Runtime penalty budget */
+	
+	/* Other numeric parameters */
+	s64 cpu_busy_thresh;       /* CPU utilization threshold (-1 for auto, 0-1024) */
+	u64 max_avg_nvcsw;         /* Max voluntary context switches */
+	
+	bool is_configured;        /* Whether this workload has optimized params */
 };
 
 #endif /* __INTF_H */

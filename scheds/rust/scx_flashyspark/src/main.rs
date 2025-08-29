@@ -39,6 +39,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+use std::path::Path;
 
 use anyhow::anyhow;
 use anyhow::bail;
@@ -71,6 +72,7 @@ use scx_utils::UserExitInfo;
 use scx_utils::NR_CPU_IDS;
 use stats::Metrics;
 use perf_monitor::PerfMonitor;
+use serde_json;
 
 
 const SCHEDULER_NAME: &str = "scx_flashyspark";
@@ -711,6 +713,11 @@ impl<'a> Scheduler<'a> {
             Self::init_l3_cache_domains(&mut skel, &topo)?;
         }
 
+        // Load ML-optimized parameters if available
+        if let Err(e) = Self::load_optimized_params(&mut skel) {
+            warn!("Failed to load optimized parameters: {}", e);
+        }
+
         // Attach the scheduler.
         let struct_ops = Some(scx_ops_attach!(skel, flashyspark_ops)?);
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
@@ -1124,6 +1131,103 @@ impl<'a> Scheduler<'a> {
         Self::init_cache_domains(skel, topo, 3, &|skel, lvl, cpu, sibling_cpu, _core_type| {
             Self::enable_sibling_cpu(skel, lvl, cpu, sibling_cpu, 0)
         })
+    }
+
+    fn load_optimized_params(skel: &mut BpfSkel<'_>) -> Result<()> {
+        // Try to load optimized parameters from the JSON file
+        let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        let params_path = Path::new(&home_dir).join("rl_scx_params/optimized_params.json");
+        
+        if !params_path.exists() {
+            info!("No optimized parameters file found at {:?}", params_path);
+            return Ok(());
+        }
+
+        info!("Loading optimized parameters from {:?}", params_path);
+        
+        let file = File::open(&params_path)?;
+        let reader = BufReader::new(file);
+        let params_data: serde_json::Value = serde_json::from_reader(reader)?;
+        
+        if !params_data.is_object() {
+            warn!("Invalid optimized parameters file format");
+            return Ok(());
+        }
+
+        // Workload type mapping
+        let workload_types = [
+            ("unknown", 0),
+            ("latency_sensitive", 1),
+            ("cpu_intensive", 2),
+            ("cache_sensitive", 3),
+            ("gpu_intensive", 4),
+            ("mixed", 5),
+        ];
+
+        for (workload_name, workload_id) in &workload_types {
+            if let Some(workload_data) = params_data.get(workload_name) {
+                if let Some(params) = workload_data.get("parameters") {
+                    let mut optimized_params = bpf_intf::optimized_params {
+                        // Boolean parameters
+                        sticky_cpu: params.get("sticky_cpu").and_then(|v| v.as_bool()).unwrap_or(false),
+                        direct_dispatch: params.get("direct_dispatch").and_then(|v| v.as_bool()).unwrap_or(false),
+                        aggressive_gpu_tasks: params.get("aggressive_gpu_tasks").and_then(|v| v.as_bool()).unwrap_or(false),
+                        local_pcpu: params.get("local_pcpu").and_then(|v| v.as_bool()).unwrap_or(false),
+                        no_wake_sync: params.get("no_wake_sync").and_then(|v| v.as_bool()).unwrap_or(false),
+                        slice_lag_scaling: params.get("slice_lag_scaling").and_then(|v| v.as_bool()).unwrap_or(false),
+                        local_kthreads: params.get("local_kthreads").and_then(|v| v.as_bool()).unwrap_or(false),
+                        stay_with_kthread: params.get("stay_with_kthread").and_then(|v| v.as_bool()).unwrap_or(false),
+                        native_priority: params.get("native_priority").and_then(|v| v.as_bool()).unwrap_or(false),
+                        tickless_sched: params.get("tickless_sched").and_then(|v| v.as_bool()).unwrap_or(false),
+                        timer_kick: params.get("timer_kick").and_then(|v| v.as_bool()).unwrap_or(false),
+                        
+                        // Time slice parameters
+                        slice_us: params.get("slice_us").and_then(|v| v.as_u64()).unwrap_or(4096),
+                        slice_us_min: params.get("slice_us_min").and_then(|v| v.as_u64()).unwrap_or(128),
+                        slice_us_lag: params.get("slice_us_lag").and_then(|v| v.as_u64()).unwrap_or(4096),
+                        run_us_lag: params.get("run_us_lag").and_then(|v| v.as_u64()).unwrap_or(32768),
+                        
+                        // Other numeric parameters
+                        cpu_busy_thresh: params.get("cpu_busy_thresh").and_then(|v| v.as_i64()).unwrap_or(-1),
+                        max_avg_nvcsw: params.get("max_avg_nvcsw").and_then(|v| v.as_u64()).unwrap_or(128),
+                        
+                        is_configured: true,
+                    };
+
+                    // Update the BPF map
+                    let key = *workload_id as u32;
+                    if let Err(e) = skel.maps.workload_params.update(
+                        &key.to_ne_bytes(),
+                        unsafe {
+                            std::slice::from_raw_parts(
+                                &optimized_params as *const _ as *const u8,
+                                std::mem::size_of_val(&optimized_params),
+                            )
+                        },
+                        libbpf_rs::MapFlags::ANY,
+                    ) {
+                        warn!("Failed to update workload params for {}: {}", workload_name, e);
+                    } else {
+                        info!("Loaded optimized parameters for workload type: {}", workload_name);
+                        info!("  Boolean params: sticky_cpu={}, direct_dispatch={}, aggressive_gpu_tasks={}, local_pcpu={}, no_wake_sync={}",
+                              optimized_params.sticky_cpu, optimized_params.direct_dispatch, 
+                              optimized_params.aggressive_gpu_tasks, optimized_params.local_pcpu, 
+                              optimized_params.no_wake_sync);
+                        info!("  More booleans: slice_lag_scaling={}, local_kthreads={}, stay_with_kthread={}, native_priority={}, tickless_sched={}, timer_kick={}",
+                              optimized_params.slice_lag_scaling, optimized_params.local_kthreads,
+                              optimized_params.stay_with_kthread, optimized_params.native_priority,
+                              optimized_params.tickless_sched, optimized_params.timer_kick);
+                        info!("  Time params (μs): slice={}, slice_min={}, slice_lag={}, run_lag={}",
+                              optimized_params.slice_us, optimized_params.slice_us_min, 
+                              optimized_params.slice_us_lag, optimized_params.run_us_lag);
+                        info!("  Other params: cpu_busy_thresh={}, max_avg_nvcsw={}",
+                              optimized_params.cpu_busy_thresh, optimized_params.max_avg_nvcsw);
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn get_metrics(&self) -> Metrics {
