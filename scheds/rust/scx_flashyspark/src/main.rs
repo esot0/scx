@@ -27,6 +27,8 @@ const CORE_TYPE_LITTLE: usize = 2;
 const CORE_TYPE_TURBO: usize = 3;
 
 mod stats;
+mod perf_monitor;
+
 use std::collections::BTreeMap;
 use std::ffi::c_int;
 use std::fmt::Write;
@@ -44,10 +46,12 @@ use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 use crossbeam::channel::RecvTimeoutError;
+use std::thread;
 use libbpf_rs::OpenObject;
 use libbpf_rs::ProgramInput;
 use libbpf_rs::AsRawLibbpf;
 use libbpf_rs::libbpf_sys::bpf_program__set_autoload;
+use libbpf_rs::MapCore;
 use log::{debug, info, warn};
 use scx_stats::prelude::*;
 use scx_utils::autopower::{fetch_power_profile, PowerProfile};
@@ -66,6 +70,7 @@ use scx_utils::Topology;
 use scx_utils::UserExitInfo;
 use scx_utils::NR_CPU_IDS;
 use stats::Metrics;
+use perf_monitor::PerfMonitor;
 
 
 const SCHEDULER_NAME: &str = "scx_flashyspark";
@@ -499,6 +504,8 @@ struct Scheduler<'a> {
     topo: Topology,
     power_profile: PowerProfile,
     stats_server: StatsServer<(), Metrics>,
+    perf_monitor: Option<PerfMonitor>,
+    perf_thread: Option<thread::JoinHandle<()>>,
     user_restart: bool,
 }
 
@@ -581,8 +588,8 @@ impl<'a> Scheduler<'a> {
         skel.maps.rodata_data.numa_disabled = numa_disabled;
         skel.maps.rodata_data.rr_sched = opts.rr_sched;
         skel.maps.rodata_data.local_pcpu = opts.local_pcpu;
-        skel.maps.rodata_data.direct_dispatch = opts.direct_dispatch;
-        skel.maps.rodata_data.sticky_cpu = opts.sticky_cpu;
+        skel.maps.bss_data.direct_dispatch = opts.direct_dispatch;
+        skel.maps.bss_data.sticky_cpu = opts.sticky_cpu;
         skel.maps.rodata_data.no_wake_sync = opts.no_wake_sync;
         skel.maps.rodata_data.tickless_sched = opts.tickless;
         skel.maps.rodata_data.native_priority = opts.native_priority;
@@ -599,7 +606,7 @@ impl<'a> Scheduler<'a> {
             "cpu" => DSQ_MODE_CPU,
             "shared" | _ => DSQ_MODE_SHARED,
         };
-        skel.maps.rodata_data.aggressive_gpu_tasks = opts.aggressive_gpu_tasks;
+        skel.maps.bss_data.aggressive_gpu_tasks = opts.aggressive_gpu_tasks;
         skel.maps.rodata_data.workload_aware_scheduling = opts.workload_aware_scheduling;
         skel.maps.rodata_data.stay_with_kthread = opts.stay_with_kthread;
         skel.maps.rodata_data.stay_with_short_exec_runtime = opts.stay_with_short_exec_runtime;
@@ -708,6 +715,14 @@ impl<'a> Scheduler<'a> {
         let struct_ops = Some(scx_ops_attach!(skel, flashyspark_ops)?);
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
 
+        // Initialize performance monitoring if workload-aware scheduling is enabled
+        let (perf_monitor, perf_thread) = if opts.workload_aware_scheduling {
+            info!("Performance monitoring will be started after scheduler initialization");
+            (Some(PerfMonitor::new()), None)
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             skel,
             struct_ops,
@@ -715,6 +730,8 @@ impl<'a> Scheduler<'a> {
             topo,
             power_profile,
             stats_server,
+            perf_monitor,
+            perf_thread,
             user_restart: false,
         })
     }
@@ -1095,7 +1112,7 @@ impl<'a> Scheduler<'a> {
         skel: &mut BpfSkel<'_>,
         topo: &Topology,
     ) -> Result<(), std::io::Error> {
-        Self::init_cache_domains(skel, topo, 2, &|skel, lvl, cpu, sibling_cpu, core_type| {
+        Self::init_cache_domains(skel, topo, 2, &|skel, lvl, cpu, sibling_cpu, _core_type| {
             Self::enable_sibling_cpu(skel, lvl, cpu, sibling_cpu, 0)
         })
     }
@@ -1104,18 +1121,31 @@ impl<'a> Scheduler<'a> {
         skel: &mut BpfSkel<'_>,
         topo: &Topology,
     ) -> Result<(), std::io::Error> {
-        Self::init_cache_domains(skel, topo, 3, &|skel, lvl, cpu, sibling_cpu, core_type| {
+        Self::init_cache_domains(skel, topo, 3, &|skel, lvl, cpu, sibling_cpu, _core_type| {
             Self::enable_sibling_cpu(skel, lvl, cpu, sibling_cpu, 0)
         })
     }
 
     fn get_metrics(&self) -> Metrics {
+        let nr_workload_dispatches = unsafe {
+            std::slice::from_raw_parts(
+                self.skel.maps.bss_data.nr_workload_dispatches.as_ptr(),
+                7, // MAX_WORKLOAD_TYPES
+            )
+        };
+        
         Metrics {
             nr_running: self.skel.maps.bss_data.nr_running,
             nr_cpus: self.skel.maps.bss_data.nr_online_cpus,
             nr_kthread_dispatches: self.skel.maps.bss_data.nr_kthread_dispatches,
             nr_direct_dispatches: self.skel.maps.bss_data.nr_direct_dispatches,
             nr_shared_dispatches: self.skel.maps.bss_data.nr_shared_dispatches,
+            nr_unknown_dispatches: nr_workload_dispatches[0],
+            nr_latency_dispatches: nr_workload_dispatches[1],
+            nr_cpu_dispatches: nr_workload_dispatches[2],
+            nr_cache_dispatches: nr_workload_dispatches[3],
+            nr_gpu_dispatches: nr_workload_dispatches[4],
+            nr_mixed_dispatches: nr_workload_dispatches[5],
         }
     }
 
@@ -1168,6 +1198,19 @@ impl<'a> Scheduler<'a> {
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
         let mut prev_cputime = Self::read_cpu_times().expect("Failed to read initial CPU stats");
         let (res_ch, req_ch) = self.stats_server.channels();
+        
+        // Start performance monitoring thread if enabled
+        if let Some(ref perf_monitor) = self.perf_monitor {
+            match perf_monitor.start_monitoring_thread(shutdown.clone()) {
+                Ok(thread) => {
+                    self.perf_thread = Some(thread);
+                    info!("Performance monitoring thread started");
+                }
+                Err(e) => {
+                    warn!("Failed to start performance monitoring thread: {}", e);
+                }
+            }
+        }
 
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
             if self.refresh_sched_domain() {
@@ -1185,7 +1228,57 @@ impl<'a> Scheduler<'a> {
                 }
             }
 
-            match req_ch.recv_timeout(Duration::from_secs(1)) {
+            // Process performance monitoring requests and updates
+            if let Some(ref mut perf_monitor) = self.perf_monitor {
+                // Check for new monitoring requests from BPF
+                // Queue maps use lookup_and_delete for popping elements
+                let key: [u8; 0] = [];
+                while let Ok(request_bytes) = self.skel.maps.perf_request_queue.lookup_and_delete(&key) {
+                    if let Some(bytes) = request_bytes {
+                        if bytes.len() >= 5 {
+                            let pid = u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                            let state = bytes[4];
+                            
+                            if let Err(e) = perf_monitor.send_request(pid, state) {
+                                warn!("Failed to send perf request: {}", e);
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                
+                // Process updates from the monitoring thread
+                use perf_monitor::MonitorCommand;
+                while let Ok(cmd) = perf_monitor.try_recv_update() {
+                    match cmd {
+                        MonitorCommand::UpdateData { pid, data } => {
+                            // Update BPF map with performance data
+                            // Convert the struct to bytes
+                            let data_bytes = unsafe {
+                                std::slice::from_raw_parts(
+                                    &data as *const _ as *const u8,
+                                    std::mem::size_of_val(&data),
+                                )
+                            };
+                            if let Err(e) = self.skel.maps.perf_data_map.update(
+                                &pid.to_ne_bytes(),
+                                data_bytes,
+                                libbpf_rs::MapFlags::ANY,
+                            ) {
+                                warn!("Failed to update perf data for PID {}: {}", pid, e);
+                            }
+                        }
+                        MonitorCommand::RemoveData { pid } => {
+                            // Remove from BPF map
+                            let _ = self.skel.maps.perf_data_map.delete(&pid.to_ne_bytes());
+                        }
+                        _ => {} // Other commands are handled by the monitoring thread
+                    }
+                }
+            }
+
+            match req_ch.recv_timeout(Duration::from_millis(100)) {
                 Ok(()) => res_ch.send(self.get_metrics())?,
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(e) => Err(e)?,
@@ -1200,6 +1293,20 @@ impl<'a> Scheduler<'a> {
 impl Drop for Scheduler<'_> {
     fn drop(&mut self) {
         info!("Unregister {} scheduler", SCHEDULER_NAME);
+
+        // Stop performance monitoring if enabled
+        if let Some(ref perf_monitor) = self.perf_monitor {
+            if let Err(e) = perf_monitor.stop() {
+                warn!("Failed to stop performance monitor: {}", e);
+            }
+        }
+        
+        // Wait for performance monitoring thread to finish
+        if let Some(thread) = self.perf_thread.take() {
+            if let Err(e) = thread.join() {
+                warn!("Failed to join performance monitoring thread: {:?}", e);
+            }
+        }
 
         // Restore default CPU idle QoS resume latency.
         if self.opts.idle_resume_us >= 0 {

@@ -113,7 +113,7 @@ const volatile bool local_kthreads;
  * If set, keep reusing the same CPU even if it's not in the primary
  * scheduling domain.
  */
-const volatile bool sticky_cpu;
+volatile bool sticky_cpu;
 
 /*
  * Prioritize per-CPU tasks (tasks that can only run on a single CPU).
@@ -132,7 +132,7 @@ const volatile bool local_pcpu;
 /*
  * Always directly dispatch a task if an idle CPU is found.
  */
-const volatile bool direct_dispatch;
+volatile bool direct_dispatch;
 
 /*
  * Enable built-in idle CPU selection policy.
@@ -155,7 +155,7 @@ const volatile bool enable_gpu_support;
 /*
  * Aggressive GPU task mode: only GPU tasks can use big/performance cores.
  */
-const volatile bool aggressive_gpu_tasks;
+volatile bool aggressive_gpu_tasks;
 
 /*
  * Stay with kthread: tasks stay on CPUs where kthreads are running. TODO: Make
@@ -192,13 +192,36 @@ volatile u64 nr_kthread_dispatches, nr_direct_dispatches, nr_shared_dispatches;
 /*
  * Workload type dispatch statistics.
  */
-volatile u64 nr_inference_dispatches, nr_training_dispatches, nr_validation_dispatches,
-    nr_preprocessing_dispatches, nr_data_loading_dispatches, nr_model_loading_dispatches;
+volatile u64 nr_workload_dispatches[MAX_WORKLOAD_TYPES];
 
 /*
- * Amount of tasks using GPU that were dispatched.
+ * Global migration counter for policy validation.
  */
-volatile u64 nr_gpu_task_dispatches;
+volatile u64 total_cpu_migrations;
+
+/*
+ * Global workload policy tracking.
+ */
+struct global_policy_state {
+    u64 workload_counts[MAX_WORKLOAD_TYPES];      /* Number of tasks per type */
+    u64 workload_cpu_time[MAX_WORKLOAD_TYPES];    /* CPU time per type */
+    u32 current_policy;                            /* Current global policy */
+    u32 previous_policy;                           /* Previous global policy */
+    u64 policy_switch_time;                        /* When policy was switched */
+    u64 policy_stability_score;                    /* How stable is current policy */
+    bool policy_locked;                            /* Prevent thrashing */
+    
+    /* Performance degradation tracking */
+    bool validation_active;                        /* Currently validating policy change */
+    u64 validation_start_time;                     /* When validation started */
+    u64 pre_switch_metrics[4];                    /* Metrics before policy switch */
+    u64 policy_lock_until;                         /* Time until policy is unlocked */
+};
+
+static struct global_policy_state global_policy = {
+    .current_policy = WORKLOAD_TYPE_UNKNOWN,
+    .previous_policy = WORKLOAD_TYPE_UNKNOWN,
+};
 
 /*
  * Amount of currently running tasks.
@@ -316,6 +339,46 @@ struct {
     __type(key, u32);
     __type(value, struct throttle_timer);
 } throttle_timer SEC(".maps");
+
+/*
+ * Timer used to evaluate global workload policy.
+ */
+struct policy_timer {
+    struct bpf_timer timer;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct policy_timer);
+} policy_timer SEC(".maps");
+
+/*
+ * Map for userspace to update performance counter data.
+ * Key is PID, value is perf event data.
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10000);
+    __type(key, u32);
+    __type(value, struct perf_event_data);
+} perf_data_map SEC(".maps");
+
+/*
+ * Tasks that need performance monitoring.
+ * Userspace polls this to know which tasks to monitor.
+ */
+struct perf_request {
+    u32 pid;
+    u8 monitoring_state;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_QUEUE);
+    __uint(max_entries, 1000);
+    __type(value, struct perf_request);
+} perf_request_queue SEC(".maps");
 
 /*
  * Per-node context.
@@ -464,22 +527,34 @@ static inline bool is_kthread(const struct task_struct *p) { return p->flags & P
  * Return true if @p can only run on a single CPU, false otherwise.
  */
 
-static int set_gpu_task(void) { //maybe worth updating to unset something as a gpu task if it's been x amount of time since last gpu access
+/*
+ * Update GPU task tracking when GPU operations are detected.
+ */
+static int track_gpu_operation(void) {
     struct task_struct *current;
-
-    if (!aggressive_gpu_tasks )
-        return 0;
+    struct task_ctx *tctx;
+    u64 now = bpf_ktime_get_ns();
 
     current = bpf_get_current_task_btf();
     if (!current)
         return -ENOENT;
-    struct task_ctx *task_ctx = try_lookup_task_ctx(current);
-    if (!task_ctx)
+        
+    tctx = try_lookup_task_ctx(current);
+    if (!tctx)
         return -ENOENT;
-    task_ctx->is_gpu_task = true;
-    task_ctx->workload_info.gpu_usage_count++;
-    task_ctx->workload_info.last_gpu_access = bpf_ktime_get_ns();
-
+        
+    /* Update GPU metrics */
+    tctx->workload_info.metrics.gpu_usage_count++;
+    tctx->workload_info.metrics.last_gpu_access = now;
+    
+    /* Boost confidence in GPU workload type */
+    tctx->workload_info.metrics.confidence_scores[WORKLOAD_TYPE_GPU_INTENSIVE] += 10;
+    if (tctx->workload_info.metrics.confidence_scores[WORKLOAD_TYPE_GPU_INTENSIVE] > 100)
+        tctx->workload_info.metrics.confidence_scores[WORKLOAD_TYPE_GPU_INTENSIVE] = 100;
+    
+    /* Mark as GPU task for legacy compatibility */
+    tctx->is_gpu_task = true;
+    
     return 0;
 }
 
@@ -499,44 +574,362 @@ static u64 get_dsq_id(s32 cpu) {
 }
 
 /*
- * Update workload statistics for a task.
+ * Two-Stage Workload Classification System
+ * ========================================
+ * 
+ * Stage 1 (Always On):
+ * - Uses lightweight scheduler-native metrics (nvcsw, runtime, migrations)
+ * - Fast and low overhead
+ * - Identifies clear patterns (latency-sensitive, CPU-intensive, I/O-bound)
+ * - Flags ambiguous cases for detailed analysis
+ * 
+ * Stage 2 (On-Demand):
+ * - Triggered when Stage 1 has low confidence or detects specific patterns
+ * - Uses hardware performance counters (cache misses, IPC, memory bandwidth)
+ * - More accurate but higher overhead
+ * - Automatically disabled once classification confidence is high
+ * 
+ * Patterns that trigger Stage 2:
+ * - Medium runtime + medium nvcsw (could be cache-sensitive)
+ * - High CPU migration rate (needs cache miss validation)
+ * - Low confidence scores across all types
+ * - Mixed workload indicators
  */
-static void update_workload_stats(struct task_struct *p, struct task_ctx *tctx, u64 now) {
-    /* Update CPU usage time */
-    if (tctx->workload_info.last_cpu_access > 0) {
-        tctx->workload_info.cpu_usage_time += now - tctx->workload_info.last_cpu_access;
-    }
-    tctx->workload_info.last_cpu_access = now;
 
-    /* Update workload type based on behavior patterns */
-    if (tctx->workload_info.workload_type == WORKLOAD_TYPE_UNKNOWN) {
-        /* High GPU usage might indicate training */
-        if (tctx->workload_info.gpu_usage_count > 100) {
-            tctx->workload_info.workload_type = WORKLOAD_TYPE_TRAINING;
+/*
+ * Stage 1: Lightweight classification using scheduler metrics.
+ * Returns confidence level and sets flags for further analysis.
+ */
+static u32 classify_stage1_lightweight(struct task_ctx *tctx) {
+    struct classification_metrics *m = &tctx->workload_info.metrics;
+    u32 best_type = WORKLOAD_TYPE_UNKNOWN;
+    u32 best_score = 0;
+    u32 i;
+    
+    /* Calculate normalized metrics */
+    u64 avg_runtime = m->behavior_samples ? m->total_runtime / m->behavior_samples : 0;
+    u64 avg_sleep = m->behavior_samples ? m->total_sleep_time / m->behavior_samples : 0;
+    u64 nvcsw_rate = m->behavior_samples ? m->wakeup_count * 1000 / m->behavior_samples : 0;
+    u64 migration_rate = m->behavior_samples ? m->cpu_migrations * 100 / m->behavior_samples : 0;
+    
+    /* Reset needs_detailed_analysis flag */
+    m->needs_detailed_analysis = 0;
+    
+    /* Score each workload type based on lightweight metrics */
+    
+    /* LATENCY_SENSITIVE: High nvcsw, short runtime */
+    if (nvcsw_rate > 100 && avg_runtime < slice_max / 4) {
+        m->confidence_scores[WORKLOAD_TYPE_LATENCY_SENSITIVE] = 
+            MIN(85, 50 + (nvcsw_rate / 10));
+    }
+    
+    /* CPU_INTENSIVE: Low nvcsw, long runtime */
+    if (nvcsw_rate < 20 && avg_runtime > slice_max / 2) {
+        m->confidence_scores[WORKLOAD_TYPE_CPU_INTENSIVE] = 
+            MIN(85, 50 + (avg_runtime * 40 / slice_max));
+    }
+    
+
+    
+    /* CACHE_SENSITIVE: Frequent CPU migrations (needs perf validation) */
+    if (migration_rate > 10) {
+        m->confidence_scores[WORKLOAD_TYPE_CACHE_SENSITIVE] = 
+            MIN(60, 30 + migration_rate);  /* Lower confidence without perf data */
+        m->needs_detailed_analysis = 1;  /* Flag for perf monitoring */
+    }
+    
+    /* GPU_INTENSIVE: Already scored by GPU operations */
+    
+    /* Find the type with highest confidence */
+    bpf_for(i, 0, MAX_WORKLOAD_TYPES) {
+        if (m->confidence_scores[i] > best_score) {
+            best_score = m->confidence_scores[i];
+            best_type = i;
         }
-        /* High I/O operations might indicate data loading */
-        else if (tctx->workload_info.io_operations > 50) {
-            tctx->workload_info.workload_type = WORKLOAD_TYPE_DATA_LOADING;
+    }
+    
+    /* Check for ambiguous patterns that need perf analysis */
+    if (best_score < CONFIDENCE_LOW_THRESHOLD) {
+        m->needs_detailed_analysis = 1;
+    }
+    
+    /* Medium runtime + medium nvcsw could be cache-sensitive */
+    if (avg_runtime > slice_max / 8 && avg_runtime < slice_max / 2 &&
+        nvcsw_rate > 30 && nvcsw_rate < 80) {
+        m->needs_detailed_analysis = 1;
+    }
+    
+    /* If no clear winner, check for mixed workload */
+    if (best_score < CONFIDENCE_THRESHOLD) {
+        u32 high_confidence_count = 0;
+        bpf_for(i, 0, MAX_WORKLOAD_TYPES) {
+            if (m->confidence_scores[i] > 40)
+                high_confidence_count++;
         }
-        /* High memory allocations might indicate model loading */
-        else if (tctx->workload_info.memory_allocations > 20) {
-            tctx->workload_info.workload_type = WORKLOAD_TYPE_MODEL_LOADING;
+        if (high_confidence_count >= 2) {
+            best_type = WORKLOAD_TYPE_MIXED;
+            m->needs_detailed_analysis = 1;
         }
+    }
+    
+    return best_type;
+}
+
+/*
+ * Stage 2: Detailed classification using performance counters.
+ * Only called when stage 1 indicates low confidence or ambiguity.
+ */
+static void classify_stage2_detailed(struct task_ctx *tctx) {
+    struct classification_metrics *m = &tctx->workload_info.metrics;
+    struct perf_event_data *perf;
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    
+    /* Look up perf data from userspace-updated map */
+    perf = bpf_map_lookup_elem(&perf_data_map, &pid);
+    if (!perf)
+        return;
+    
+    /* Check if we have fresh perf data */
+    if (perf->perf_sample_count < 5)
+        return;
+        
+    /* Copy perf data to task context for future reference */
+    __builtin_memcpy(&tctx->workload_info.perf_data, perf, sizeof(*perf));
+        
+    /* Calculate cache miss rate */
+    if (perf->llc_references > 0) {
+        u64 llc_miss_rate = (perf->llc_misses * 100) / perf->llc_references;
+        
+        /* High LLC miss rate indicates cache-sensitive workload */
+        if (llc_miss_rate > 20) {
+            m->confidence_scores[WORKLOAD_TYPE_CACHE_SENSITIVE] = 
+                MIN(95, 70 + llc_miss_rate);
+        }
+    }
+    
+    /* Calculate TLB miss rate */
+    if (perf->tlb_references > 0) {
+        u64 tlb_miss_rate = (perf->tlb_misses * 100) / perf->tlb_references;
+        
+        /* High TLB miss rate also indicates cache sensitivity */
+        if (tlb_miss_rate > 10) {
+            m->confidence_scores[WORKLOAD_TYPE_CACHE_SENSITIVE] += 10;
+            if (m->confidence_scores[WORKLOAD_TYPE_CACHE_SENSITIVE] > 95)
+                m->confidence_scores[WORKLOAD_TYPE_CACHE_SENSITIVE] = 95;
+        }
+    }
+    
+    /* Calculate IPC */
+    if (perf->cycles > 0) {
+        u64 ipc = (perf->instructions_retired * 100) / perf->cycles;
+        
+        /* High IPC with low nvcsw indicates CPU-intensive */
+        if (ipc > 150 && m->wakeup_count < 50) {
+            m->confidence_scores[WORKLOAD_TYPE_CPU_INTENSIVE] = 
+                MIN(95, m->confidence_scores[WORKLOAD_TYPE_CPU_INTENSIVE] + 20);
+        }
+        
+        /* Low IPC might indicate memory-bound */
+        if (ipc < 50) {
+            m->confidence_scores[WORKLOAD_TYPE_CACHE_SENSITIVE] += 10;
+        }
+    }
+    
+    /* NUMA locality check */
+    if (perf->local_memory_accesses + perf->remote_memory_accesses > 0) {
+        u64 remote_ratio = (perf->remote_memory_accesses * 100) / 
+                          (perf->local_memory_accesses + perf->remote_memory_accesses);
+        
+        /* High remote memory access indicates need for better placement */
+        if (remote_ratio > 30) {
+            m->confidence_scores[WORKLOAD_TYPE_CACHE_SENSITIVE] += 15;
+        }
+    }
+    
+    /* We've done detailed analysis, can disable perf monitoring now */
+    if (m->confidence_scores[tctx->workload_info.current_type] >= CONFIDENCE_THRESHOLD) {
+        m->perf_mon_state = PERF_MON_DISABLED;
+        m->needs_detailed_analysis = 0;
+    }
+}
+
+/*
+ * Manage performance monitoring state transitions.
+ */
+static void manage_perf_monitoring(struct task_ctx *tctx) {
+    struct classification_metrics *m = &tctx->workload_info.metrics;
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    struct perf_request req;
+    
+    switch (m->perf_mon_state) {
+    case PERF_MON_DISABLED:
+        /* Enable perf monitoring if needed */
+        if (m->needs_detailed_analysis) {
+            m->perf_mon_state = PERF_MON_PENDING;
+            
+            /* Send request to userspace */
+            req.pid = pid;
+            req.monitoring_state = PERF_MON_PENDING;
+            bpf_map_push_elem(&perf_request_queue, &req, BPF_EXIST);
+            
+            dbg_msg("Task %d needs perf monitoring for classification", pid);
+        }
+        break;
+        
+    case PERF_MON_PENDING:
+        /* Check if userspace has started monitoring */
+        {
+            struct perf_event_data *perf_data;
+            perf_data = bpf_map_lookup_elem(&perf_data_map, &pid);
+            if (perf_data && perf_data->perf_sample_count > 0) {
+                m->perf_mon_state = PERF_MON_ACTIVE;
+                dbg_msg("Task %d perf monitoring activated", pid);
+            }
+        }
+        break;
+        
+    case PERF_MON_ACTIVE:
+        /* Check if we can disable perf monitoring */
+        if (!m->needs_detailed_analysis && 
+            tctx->workload_info.type_confidence >= CONFIDENCE_THRESHOLD) {
+            m->perf_mon_state = PERF_MON_DISABLED;
+            
+            /* Send stop request to userspace */
+            req.pid = pid;
+            req.monitoring_state = PERF_MON_DISABLED;
+            bpf_map_push_elem(&perf_request_queue, &req, BPF_EXIST);
+            
+            /* Clean up perf data */
+            bpf_map_delete_elem(&perf_data_map, &pid);
+            
+            dbg_msg("Task %d no longer needs perf monitoring", pid);
+        }
+        break;
+    }
+}
+
+/*
+ * Update workload classification for a task.
+ */
+static void classify_task_incremental(struct task_struct *p, struct task_ctx *tctx) {
+    struct workload_info *wi = &tctx->workload_info;
+    struct classification_metrics *m = &wi->metrics;
+    u64 now = bpf_ktime_get_ns();
+    u32 new_type;
+    
+    /* Once a policy is assigned, it doesn't change for the task's lifetime */
+    if (wi->current_type != WORKLOAD_TYPE_UNKNOWN)
+        return;
+    
+    /* Check if enough time has passed for classification */
+    if (now - m->last_classification < CLASSIFICATION_INTERVAL_NS)
+        return;
+        
+    /* Need minimum samples for classification */
+    if (m->behavior_samples < MIN_SAMPLES_FOR_CLASSIFICATION)
+        return;
+    
+    new_type = classify_stage1_lightweight(tctx);
+    
+    if (m->perf_mon_state == PERF_MON_ACTIVE) {
+        classify_stage2_detailed(tctx);
+        u32 best_type = WORKLOAD_TYPE_UNKNOWN;
+        u32 best_score = 0;
+        u32 i;
+        
+        bpf_for(i, 0, MAX_WORKLOAD_TYPES) {
+            if (m->confidence_scores[i] > best_score) {
+                best_score = m->confidence_scores[i];
+                best_type = i;
+            }
+        }
+        if (best_score >= CONFIDENCE_THRESHOLD)
+            new_type = best_type;
+    }
+    
+    /* Update classification if confidence is high enough */
+    if (m->confidence_scores[new_type] >= CONFIDENCE_THRESHOLD || 
+        (new_type != WORKLOAD_TYPE_UNKNOWN && m->confidence_scores[new_type] > wi->type_confidence)) {
+        
+        /* Update history */
+        wi->previous_type = wi->current_type;
+        wi->current_type = new_type;
+        wi->type_confidence = m->confidence_scores[new_type];
+        
+        /* Add to rolling history */
+        wi->type_history[wi->history_index] = new_type;
+        wi->history_index = (wi->history_index + 1) % 4;
+        
+        /* Set policy hints based on workload type */
+        switch (new_type) {
+        case WORKLOAD_TYPE_LATENCY_SENSITIVE:
+            wi->latency_critical = 1;
+            wi->prefer_cache_local = 1;
+            wi->prefer_big_core = 0;
+            break;
+        case WORKLOAD_TYPE_CPU_INTENSIVE:
+            wi->latency_critical = 0;
+            wi->prefer_cache_local = 1;
+            wi->prefer_big_core = 1;
+            break;
+        case WORKLOAD_TYPE_GPU_INTENSIVE:
+            wi->latency_critical = 1;
+            wi->prefer_cache_local = 0;
+            wi->prefer_big_core = 1;
+            break;
+        case WORKLOAD_TYPE_CACHE_SENSITIVE:
+            wi->latency_critical = 0;
+            wi->prefer_cache_local = 1;
+            wi->prefer_big_core = 0;
+            break;
+
+        case WORKLOAD_TYPE_MIXED:
+            wi->latency_critical = 0;
+            wi->prefer_cache_local = 1;
+            wi->prefer_big_core = 0;
+            break;
+        default:
+            wi->latency_critical = 0;
+            wi->prefer_cache_local = 0;
+            wi->prefer_big_core = 0;
+            break;
+        }
+        
+        __sync_fetch_and_add(&global_policy.workload_counts[new_type], 1);
+        if (wi->previous_type != WORKLOAD_TYPE_UNKNOWN)
+            __sync_fetch_and_sub(&global_policy.workload_counts[wi->previous_type], 1);
+            
+        dbg_msg("Task %d classified as %u with confidence %u%% (perf: %s)",
+                bpf_get_current_pid_tgid() >> 32, new_type, wi->type_confidence,
+                m->perf_mon_state == PERF_MON_ACTIVE ? "yes" : "no");
+    }
+    
+    /* Manage performance monitoring state */
+    manage_perf_monitoring(tctx);
+    
+    /* Reset classification timer and decay confidence scores */
+    m->last_classification = now;
+    m->classification_count++;
+    
+    /* Decay confidence scores to allow adaptation */
+    u32 i;
+    bpf_for(i, 0, MAX_WORKLOAD_TYPES) {
+        if (m->confidence_scores[i] > 10)
+            m->confidence_scores[i] -= 5;
     }
 }
 
 /*
  * GPU detection kprobes.
  */
-
 SEC("kprobe/nvidia_poll")
-int kprobe_nvidia_poll() { return set_gpu_task(); }
+int kprobe_nvidia_poll() { return track_gpu_operation(); }
 
 SEC("kprobe/nvidia_open")
-int kprobe_nvidia_open() { return set_gpu_task(); }
+int kprobe_nvidia_open() { return track_gpu_operation(); }
 
 SEC("kprobe/nvidia_mmap")
-int kprobe_nvidia_mmap() { return set_gpu_task(); }
+int kprobe_nvidia_mmap() { return track_gpu_operation(); }
 
 static bool is_pcpu_task(const struct task_struct *p) {
     return p->nr_cpus_allowed == 1 || is_migration_disabled(p);
@@ -1099,6 +1492,87 @@ static s32 pick_idle_little_cpu(struct task_ctx *tctx, s32 prev_cpu, u64 wake_fl
 }
 
 /*
+ * Pick an idle CPU based on workload type preferences.
+ */
+static s32 pick_idle_cpu_for_workload(struct task_struct *p, struct task_ctx *tctx, 
+                                      s32 prev_cpu, u64 wake_flags, bool *is_idle) {
+    struct workload_info *wi = &tctx->workload_info;
+    s32 cpu = -1;
+    int ret;
+    
+    /* Handle workload-specific CPU selection */
+    switch (wi->current_type) {
+    case WORKLOAD_TYPE_LATENCY_SENSITIVE:
+        /* Prefer same CPU or cache-local CPU for latency */
+        if (wi->prefer_cache_local && scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+            *is_idle = true;
+            return prev_cpu;
+        }
+        /* Try little cores for better latency predictability */
+        ret = pick_idle_little_cpu(tctx, prev_cpu, wake_flags, is_idle, &cpu);
+        if (ret > 0)
+            return cpu;
+        break;
+        
+    case WORKLOAD_TYPE_CPU_INTENSIVE:
+        /* Prefer big cores for compute-intensive tasks */
+        if (wi->prefer_big_core) {
+            ret = pick_idle_turbo_cpu(prev_cpu, wake_flags, is_idle, &cpu);
+            if (ret > 0)
+                return cpu;
+            ret = pick_idle_big_cpu(tctx, prev_cpu, wake_flags, is_idle, &cpu);
+            if (ret > 0)
+                return cpu;
+        }
+        break;
+        
+    case WORKLOAD_TYPE_GPU_INTENSIVE:
+        /* Prefer big cores near GPU for coordination */
+        if (aggressive_gpu_tasks) {
+            ret = pick_idle_turbo_cpu(prev_cpu, wake_flags, is_idle, &cpu);
+            if (ret > 0)
+                return cpu;
+            ret = pick_idle_big_cpu(tctx, prev_cpu, wake_flags, is_idle, &cpu);
+            if (ret > 0)
+                return cpu;
+        }
+        break;
+        
+    case WORKLOAD_TYPE_CACHE_SENSITIVE:
+        /* Strong preference for cache locality */
+        if (wi->prefer_cache_local) {
+            /* Try L2 siblings first */
+            if (tctx->l2_cpumask) {
+                cpu = find_idle_cpu_in_mask(cast_mask(tctx->l2_cpumask), 0);
+                if (cpu >= 0) {
+                    *is_idle = true;
+                    return cpu;
+                }
+            }
+            /* Then L3 siblings */
+            if (tctx->l3_cpumask) {
+                cpu = find_idle_cpu_in_mask(cast_mask(tctx->l3_cpumask), 0);
+                if (cpu >= 0) {
+                    *is_idle = true;
+                    return cpu;
+                }
+            }
+        }
+        break;
+        
+
+        
+    case WORKLOAD_TYPE_MIXED:
+    case WORKLOAD_TYPE_UNKNOWN:
+    default:
+        /* Fall through to default selection */
+        break;
+    }
+    
+    return -1;
+}
+
+/*
  * Find an idle CPU in the system.
  *
  * NOTE: the idle CPU selection doesn't need to be formally perfect, it is
@@ -1135,6 +1609,13 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *tctx, s32 prev_
     tctx = try_lookup_task_ctx(p);
     if (!tctx)
         return -ENOENT;
+
+    /* Try workload-aware CPU selection first */
+    if (workload_aware_scheduling) {
+        cpu = pick_idle_cpu_for_workload(p, tctx, prev_cpu, wake_flags, is_idle);
+        if (cpu >= 0)
+            return cpu;
+    }
 
     is_gpu_task = tctx->is_gpu_task;
 
@@ -1835,26 +2316,22 @@ void BPF_STRUCT_OPS(flashyspark_enqueue, struct task_struct *p, u64 enq_flags) {
     scx_bpf_put_cpumask(idle_cpumask);
 
 workload_statistics:
-    switch (tctx->workload_info.workload_type) {
-    case WORKLOAD_TYPE_INFERENCE:
-        __sync_fetch_and_add(&nr_inference_dispatches, 1);
-        break;
-    case WORKLOAD_TYPE_TRAINING:
-        __sync_fetch_and_add(&nr_training_dispatches, 1);
-        break;
-    case WORKLOAD_TYPE_VALIDATION:
-        __sync_fetch_and_add(&nr_validation_dispatches, 1);
-        break;
-    case WORKLOAD_TYPE_PREPROCESSING:
-        __sync_fetch_and_add(&nr_preprocessing_dispatches, 1);
-        break;
-    case WORKLOAD_TYPE_DATA_LOADING:
-        __sync_fetch_and_add(&nr_data_loading_dispatches, 1);
-        break;
-    case WORKLOAD_TYPE_MODEL_LOADING:
-        __sync_fetch_and_add(&nr_model_loading_dispatches, 1);
-        break;
+    /* Update classification metrics */
+    if (!(enq_flags & SCX_ENQ_REENQ)) {
+        struct classification_metrics *m = &tctx->workload_info.metrics;
+        
+        m->behavior_samples++;
+        
+        if (enq_flags & SCX_ENQ_WAKEUP)
+            m->wakeup_count++;
+            
+        if (prev_cpu != scx_bpf_task_cpu(p)) {
+            m->cpu_migrations++;
+            __sync_fetch_and_add(&total_cpu_migrations, 1);
+        }
     }
+    
+    __sync_fetch_and_add(&nr_workload_dispatches[tctx->workload_info.current_type], 1);
 }
 
 /*
@@ -2053,13 +2530,24 @@ static void update_cpu_load(struct task_struct *p, struct task_ctx *tctx) {
 void BPF_STRUCT_OPS(flashyspark_running, struct task_struct *p) {
     struct task_ctx *tctx;
     struct cpu_ctx *cctx;
+    u64 now = scx_bpf_now();
 
     __sync_fetch_and_add(&nr_running, 1);
 
     tctx = try_lookup_task_ctx(p);
     if (!tctx)
         return;
-    tctx->last_run_at = scx_bpf_now();
+    
+    /* Update runtime tracking */
+    tctx->last_run_at = now;
+    
+    /* Update sleep time metrics if task was sleeping */
+    if (tctx->last_sleep_at > 0 && tctx->last_sleep_at < now) {
+        u64 sleep_duration = now - tctx->last_sleep_at;
+        tctx->workload_info.metrics.total_sleep_time += sleep_duration;
+        tctx->workload_info.metrics.avg_sleep_duration = 
+            calc_avg(tctx->workload_info.metrics.avg_sleep_duration, sleep_duration);
+    }
 
     if(stay_with_short_exec_runtime && tctx->exec_runtime <= slice_max / 100) {
         cctx = try_lookup_cpu_ctx(scx_bpf_task_cpu(p));
@@ -2075,6 +2563,8 @@ void BPF_STRUCT_OPS(flashyspark_running, struct task_struct *p) {
         }
     }
 
+    /* Perform workload classification */
+    classify_task_incremental(p, tctx);
 
     /*
      * Adjust target CPU frequency before the task starts to run.
@@ -2101,16 +2591,24 @@ void BPF_STRUCT_OPS(flashyspark_stopping, struct task_struct *p, bool runnable) 
 
     __sync_fetch_and_sub(&nr_running, 1);
 
+    tctx = try_lookup_task_ctx(p);
+    if (!tctx)
+        return;
+
+    /*
+     * Evaluate the time slice used by the task.
+     */
+    slice = MIN(now - tctx->last_run_at, slice_max);
+    
+    /* Update workload metrics */
+    tctx->workload_info.metrics.total_runtime += slice;
+    tctx->workload_info.metrics.avg_runtime_per_slice = 
+        calc_avg(tctx->workload_info.metrics.avg_runtime_per_slice, slice);
+    
+    /* Update global CPU time tracking for workload type */
+    __sync_fetch_and_add(&global_policy.workload_cpu_time[tctx->workload_info.current_type], slice);
+
     if (!rr_sched) {
-        tctx = try_lookup_task_ctx(p);
-        if (!tctx)
-            return;
-
-        /*
-         * Evaluate the time slice used by the task.
-         */
-        slice = MIN(now - tctx->last_run_at, slice_max);
-
         /*
          * Update task's execution time (exec_runtime), but never
          * account more than @run_lag to prevent excessive
@@ -2153,6 +2651,21 @@ void BPF_STRUCT_OPS(flashyspark_quiescent, struct task_struct *p, u64 deq_flags)
     s64 delta_t;
     struct task_ctx *tctx;
 
+    tctx = try_lookup_task_ctx(p);
+    if (!tctx)
+        return;
+
+    /*
+     * Update sleep timestamp for all sleep events
+     */
+    if (deq_flags & SCX_DEQ_SLEEP) {
+        tctx->last_sleep_at = now;
+        
+        /* Track voluntary context switches for classification */
+        if (tctx->workload_info.metrics.behavior_samples < 1000)
+            tctx->workload_info.metrics.wakeup_count++;
+    }
+
     if (rr_sched || !max_avg_nvcsw)
         return;
 
@@ -2160,10 +2673,6 @@ void BPF_STRUCT_OPS(flashyspark_quiescent, struct task_struct *p, u64 deq_flags)
      * Update voluntary context switch rate only on task sleep events.
      */
     if (!(deq_flags & SCX_DEQ_SLEEP))
-        return;
-
-    tctx = try_lookup_task_ctx(p);
-    if (!tctx)
         return;
 
     /*
@@ -2174,7 +2683,6 @@ void BPF_STRUCT_OPS(flashyspark_quiescent, struct task_struct *p, u64 deq_flags)
         u64 nvcsw = slice_max / delta_t;
 
         tctx->avg_nvcsw = calc_avg_clamp(tctx->avg_nvcsw, nvcsw, 0, max_avg_nvcsw);
-        tctx->last_sleep_at = now;
     }
 }
 
@@ -2265,6 +2773,32 @@ s32 BPF_STRUCT_OPS(flashyspark_init_task, struct task_struct *p, struct scx_init
         return err;
 
     return 0;
+}
+
+void BPF_STRUCT_OPS(flashyspark_exit_task, struct task_struct *p, struct scx_exit_task_args *args) {
+    struct task_ctx *tctx;
+    
+    tctx = try_lookup_task_ctx(p);
+    if (!tctx)
+        return;
+    
+    /* Decrement workload count when task exits */
+    if (tctx->workload_info.current_type != WORKLOAD_TYPE_UNKNOWN && 
+        tctx->workload_info.current_type < MAX_WORKLOAD_TYPES) {
+        if (global_policy.workload_counts[tctx->workload_info.current_type] > 0)
+            __sync_fetch_and_sub(&global_policy.workload_counts[tctx->workload_info.current_type], 1);
+    }
+    
+    /* Clean up perf monitoring if active */
+    if (tctx->workload_info.metrics.perf_mon_state != PERF_MON_DISABLED) {
+        u32 pid = p->pid;
+        struct perf_request req = {
+            .pid = pid,
+            .monitoring_state = PERF_MON_DISABLED,
+        };
+        bpf_map_push_elem(&perf_request_queue, &req, BPF_EXIST);
+        bpf_map_delete_elem(&perf_data_map, &pid);
+    }
 }
 
 /*
@@ -2551,6 +3085,254 @@ static int numa_timerfn(void *map, int *key, struct bpf_timer *timer) {
     return 0;
 }
 
+/*
+ * Collect current system metrics for policy validation.
+ */
+static void collect_policy_metrics(u64 *metrics) {
+    u32 cpu;
+    u64 total_runtime = 0;
+    u64 total_tasks = 0;
+    
+    /* Collect total runtime from all CPUs */
+    bpf_for(cpu, 0, nr_cpu_ids) {
+        struct cpu_ctx *cctx = try_lookup_cpu_ctx(cpu);
+        if (cctx) {
+            total_runtime += cctx->tot_runtime;
+        }
+    }
+    
+    /* Count total tasks per workload type */
+    u32 i;
+    bpf_for(i, 0, MAX_WORKLOAD_TYPES) {
+        total_tasks += global_policy.workload_counts[i];
+    }
+    
+    /* Store key metrics for validation */
+    metrics[0] = total_cpu_migrations;  /* Total migrations across system */
+    metrics[1] = 0;  /* Reserved for future cache miss tracking */
+    metrics[2] = total_runtime;
+    metrics[3] = total_tasks;
+}
+
+/*
+ * Validate that a policy change improved performance.
+ * Returns true if the policy should be kept, false if it should be reverted.
+ */
+static bool validate_policy_change(u32 policy_type) {
+    u64 current_metrics[4];
+    collect_policy_metrics(current_metrics);
+    
+    switch (policy_type) {
+    case WORKLOAD_TYPE_CACHE_SENSITIVE:
+        /* For cache-sensitive workloads, we expect reduced migrations */
+        if (global_policy.pre_switch_metrics[0] > 0) {
+            u64 migration_change = current_metrics[0] * 100 / global_policy.pre_switch_metrics[0];
+            /* If migrations increased by more than 10%, policy failed */
+            if (migration_change > 110) {
+                dbg_msg("Cache-sensitive policy validation failed: migrations increased by %llu%%",
+                        migration_change - 100);
+                return false;
+            }
+        }
+        break;
+        
+    case WORKLOAD_TYPE_CPU_INTENSIVE:
+        /* For CPU-intensive workloads, we expect better CPU utilization */
+        if (global_policy.pre_switch_metrics[2] > 0) {
+            u64 runtime_change = current_metrics[2] * 100 / global_policy.pre_switch_metrics[2];
+            /* If runtime efficiency dropped by more than 5%, policy failed */
+            if (runtime_change < 95) {
+                dbg_msg("CPU-intensive policy validation failed: runtime efficiency dropped by %llu%%",
+                        100 - runtime_change);
+                return false;
+            }
+        }
+        break;
+        
+    case WORKLOAD_TYPE_LATENCY_SENSITIVE:
+        /* For latency-sensitive workloads, monitor task count stability */
+        if (global_policy.pre_switch_metrics[3] > 0) {
+            u64 task_change = current_metrics[3] * 100 / global_policy.pre_switch_metrics[3];
+            /* If active task count dropped significantly, policy may be causing starvation */
+            if (task_change < 80) {
+                dbg_msg("Latency-sensitive policy validation failed: active tasks dropped by %llu%%",
+                        100 - task_change);
+                return false;
+            }
+        }
+        break;
+    }
+    
+    return true;
+}
+
+/*
+ * Global policy evaluation timer.
+ */
+static int policy_timerfn(void *map, int *key, struct bpf_timer *timer) {
+    u64 total_tasks = 0;
+    u64 total_cpu_time = 0;
+    u32 best_policy = WORKLOAD_TYPE_UNKNOWN;
+    u64 best_percentage = 0;
+    u64 now = bpf_ktime_get_ns();
+    u32 i;
+    int err;
+    
+    /* First, check if we're in validation phase */
+    if (global_policy.validation_active) {
+        /* Check if validation period (10 seconds) has elapsed */
+        if (now - global_policy.validation_start_time >= 10ULL * NSEC_PER_SEC) {
+            /* Validate the policy change */
+            if (!validate_policy_change(global_policy.current_policy)) {
+                /* Policy failed validation, revert to previous */
+                dbg_msg("Policy %u failed validation, reverting to %u",
+                        global_policy.current_policy, global_policy.previous_policy);
+                
+                u32 failed_policy = global_policy.current_policy;
+                global_policy.current_policy = global_policy.previous_policy;
+                global_policy.previous_policy = failed_policy;
+                
+                /* Lock policy to prevent immediate re-attempt */
+                global_policy.policy_locked = true;
+                global_policy.policy_lock_until = now + 30ULL * NSEC_PER_SEC;
+                
+                /* Revert scheduler parameters based on previous policy */
+                switch (global_policy.current_policy) {
+                case WORKLOAD_TYPE_CACHE_SENSITIVE:
+                    sticky_cpu = true;
+                    break;
+                case WORKLOAD_TYPE_GPU_INTENSIVE:
+                    aggressive_gpu_tasks = true;
+                    break;
+                default:
+                    /* Reset to defaults */
+                    sticky_cpu = false;
+                    aggressive_gpu_tasks = false;
+                    direct_dispatch = false;
+                    break;
+                }
+            }
+            
+            global_policy.validation_active = false;
+        }
+    }
+    
+    /* Check if policy lock has expired */
+    if (global_policy.policy_locked && now >= global_policy.policy_lock_until) {
+        global_policy.policy_locked = false;
+    }
+    
+    /* Calculate total tasks and CPU time */
+    bpf_for(i, 0, MAX_WORKLOAD_TYPES) {
+        total_tasks += global_policy.workload_counts[i];
+        total_cpu_time += global_policy.workload_cpu_time[i];
+    }
+    
+    if (total_tasks == 0 || total_cpu_time == 0)
+        goto out_rearm;
+    
+    /* Find dominant workload type */
+    bpf_for(i, 0, MAX_WORKLOAD_TYPES) {
+        u64 task_percentage = 0;
+        u64 cpu_percentage = 0;
+        u64 combined_percentage = 0;
+        
+        if (global_policy.workload_counts[i] > 0) {
+            task_percentage = (global_policy.workload_counts[i] * 100) / total_tasks;
+            cpu_percentage = (global_policy.workload_cpu_time[i] * 100) / total_cpu_time;
+            
+            /* Weight CPU time more heavily than task count */
+            combined_percentage = (task_percentage + cpu_percentage * 2) / 3;
+            
+            if (combined_percentage > best_percentage) {
+                best_percentage = combined_percentage;
+                best_policy = i;
+            }
+        }
+    }
+    
+    /* Check if we should switch policy */
+    if (best_policy != global_policy.current_policy && !global_policy.validation_active) {
+        u64 required_threshold = POLICY_SWITCH_THRESHOLD;
+        
+        /* Add hysteresis if we're switching away from current policy */
+        if (global_policy.current_policy != WORKLOAD_TYPE_UNKNOWN)
+            required_threshold += POLICY_SWITCH_HYSTERESIS;
+        
+        if (best_percentage >= required_threshold && !global_policy.policy_locked) {
+            /* Prevent policy thrashing with 10-second cooldown */
+            if (now - global_policy.policy_switch_time > 10ULL * NSEC_PER_SEC) {
+                dbg_msg("Global policy switch: %u -> %u (%llu%% dominance)",
+                        global_policy.current_policy, best_policy, best_percentage);
+                
+                /* Collect pre-switch metrics for validation */
+                collect_policy_metrics(global_policy.pre_switch_metrics);
+                
+                global_policy.previous_policy = global_policy.current_policy;
+                global_policy.current_policy = best_policy;
+                global_policy.policy_switch_time = now;
+                global_policy.policy_stability_score = 0;
+                
+                /* Start validation period */
+                global_policy.validation_active = true;
+                global_policy.validation_start_time = now;
+                
+                /* Apply policy-specific scheduler parameters */
+                switch (best_policy) {
+                case WORKLOAD_TYPE_LATENCY_SENSITIVE:
+                    /* Optimize for low latency */
+                    // Note: slice_lag adjustment disabled since it's const volatile
+                    // if (slice_lag_scaling)
+                    //     slice_lag = MIN(slice_lag * 2, 8192ULL * NSEC_PER_USEC);
+                    break;
+                    
+                case WORKLOAD_TYPE_CPU_INTENSIVE:
+                    /* Optimize for throughput */
+                    // Note: slice_lag adjustment disabled since it's const volatile
+                    // if (slice_lag_scaling)
+                    //     slice_lag = MAX(slice_lag / 2, 2048ULL * NSEC_PER_USEC);
+                    break;
+                    
+                case WORKLOAD_TYPE_CACHE_SENSITIVE:
+                    /* Minimize migrations */
+                    sticky_cpu = true;
+                    break;
+                    
+                case WORKLOAD_TYPE_GPU_INTENSIVE:
+                    /* Ensure GPU tasks get big cores */
+                    aggressive_gpu_tasks = true;
+                    break;
+                    
+                default:
+                    /* Reset to default parameters */
+                    sticky_cpu = false;
+                    aggressive_gpu_tasks = false;
+                    direct_dispatch = false;
+                    break;
+                }
+            }
+        }
+    } else if (!global_policy.validation_active) {
+        /* Increase stability score if no policy change and not validating */
+        if (global_policy.policy_stability_score < 100)
+            global_policy.policy_stability_score++;
+    }
+    
+    /* Decay CPU time measurements to give recent behavior more weight */
+    bpf_for(i, 0, MAX_WORKLOAD_TYPES) {
+        global_policy.workload_cpu_time[i] = 
+            (global_policy.workload_cpu_time[i] * 3) / 4;
+    }
+
+out_rearm:
+    /* Re-arm timer for 2 seconds */
+    err = bpf_timer_start(timer, 2 * NSEC_PER_SEC, 0);
+    if (err)
+        scx_bpf_error("Failed to re-arm policy timer");
+    
+    return 0;
+}
+
 s32 BPF_STRUCT_OPS_SLEEPABLE(flashyspark_init) {
     struct bpf_timer *timer;
     int err, node;
@@ -2701,6 +3483,23 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(flashyspark_init) {
         return err;
     }
 
+    /* Initialize workload policy timer if workload-aware scheduling is enabled */
+    if (workload_aware_scheduling) {
+        timer = bpf_map_lookup_elem(&policy_timer, &key);
+        if (!timer) {
+            scx_bpf_error("Failed to lookup policy timer");
+            return -ESRCH;
+        }
+
+        bpf_timer_init(timer, &policy_timer, CLOCK_BOOTTIME);
+        bpf_timer_set_callback(timer, policy_timerfn);
+        err = bpf_timer_start(timer, 2 * NSEC_PER_SEC, 0);
+        if (err) {
+            scx_bpf_error("Failed to start policy timer");
+            return err;
+        }
+    }
+
     return 0;
 }
 
@@ -2715,5 +3514,6 @@ SCX_OPS_DEFINE(flashyspark_ops, .select_cpu = (void *)flashyspark_select_cpu,
                .runnable = (void *)flashyspark_runnable, .quiescent = (void *)flashyspark_quiescent,
                .cpu_release = (void *)flashyspark_cpu_release,
                .set_cpumask = (void *)flashyspark_set_cpumask, .enable = (void *)flashyspark_enable,
-               .init_task = (void *)flashyspark_init_task, .init = (void *)flashyspark_init,
+               .init_task = (void *)flashyspark_init_task, .exit_task = (void *)flashyspark_exit_task,
+               .init = (void *)flashyspark_init,
                .exit = (void *)flashyspark_exit, .timeout_ms = 5000, .name = "flashyspark");

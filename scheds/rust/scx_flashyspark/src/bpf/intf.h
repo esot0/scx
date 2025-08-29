@@ -30,17 +30,32 @@ enum consts {
 	/* Maximum command name length for workload detection */
 	MAX_COMM_LEN = 16,
 
+	/* Workload types */
 	WORKLOAD_TYPE_UNKNOWN = 0,
-	WORKLOAD_TYPE_INFERENCE = 1,
-	WORKLOAD_TYPE_TRAINING = 2,
-	WORKLOAD_TYPE_VALIDATION = 3,
-	WORKLOAD_TYPE_PREPROCESSING = 4,
-	WORKLOAD_TYPE_DATA_LOADING = 5,
-	WORKLOAD_TYPE_MODEL_LOADING = 6,
+	WORKLOAD_TYPE_LATENCY_SENSITIVE = 1,  /* High nvcsw, short bursts */
+	WORKLOAD_TYPE_CPU_INTENSIVE = 2,      /* Low nvcsw, long runtime */
+	WORKLOAD_TYPE_CACHE_SENSITIVE = 3,    /* High LLC/TLB misses */
+	WORKLOAD_TYPE_GPU_INTENSIVE = 4,      /* GPU operations detected */
+	WORKLOAD_TYPE_MIXED = 5,              /* Mixed characteristics */
+	MAX_WORKLOAD_TYPES = 6,
 
+	/* Core types */
 	CORE_TYPE_BIG = 1,
 	CORE_TYPE_LITTLE = 2,
 	CORE_TYPE_TURBO = 3,
+
+	/* Classification constants */
+	MIN_SAMPLES_FOR_CLASSIFICATION = 10,
+	CLASSIFICATION_INTERVAL_NS = 500 * NSEC_PER_MSEC,
+	CONFIDENCE_THRESHOLD = 70,            /* 70% confidence required */
+	CONFIDENCE_LOW_THRESHOLD = 40,        /* Below this, enable perf monitoring */
+	POLICY_SWITCH_THRESHOLD = 25,         /* 25% of tasks for global policy */
+	POLICY_SWITCH_HYSTERESIS = 5,         /* 5% hysteresis band */
+	
+	/* Perf event monitoring states */
+	PERF_MON_DISABLED = 0,
+	PERF_MON_PENDING = 1,
+	PERF_MON_ACTIVE = 2,
 };
 
 #ifndef __VMLINUX_H__
@@ -70,15 +85,80 @@ struct domain_arg {
 	s32 core_type;
 };
 
+/* Performance event data collected on-demand */
+struct perf_event_data {
+	/* Cache performance */
+	u64 llc_misses;                /* Last level cache misses */
+	u64 llc_references;            /* Last level cache references */
+	u64 tlb_misses;                /* TLB misses */
+	u64 tlb_references;            /* TLB references */
+	
+	/* Memory bandwidth */
+	u64 memory_bandwidth;          /* Estimated memory bandwidth usage */
+	u64 local_memory_accesses;     /* NUMA local memory accesses */
+	u64 remote_memory_accesses;    /* NUMA remote memory accesses */
+	
+	/* CPU performance */
+	u64 instructions_retired;      /* Total instructions executed */
+	u64 cycles;                    /* CPU cycles consumed */
+	u64 branch_misses;             /* Branch mispredictions */
+	
+	/* Monitoring metadata */
+	u64 last_perf_sample;          /* Last perf event sample time */
+	u32 perf_sample_count;         /* Number of perf samples collected */
+	u32 _padding;                  /* Padding for alignment */
+};
+
+/* Classification metrics for workload detection */
+struct classification_metrics {
+	/* Behavior counters */
+	u64 behavior_samples;          /* Total samples collected */
+	u64 wakeup_count;              /* Number of wakeups */
+	u64 io_wait_count;             /* Times task waited for I/O */
+	u64 cpu_migrations;            /* Number of CPU migrations */
+	u64 cache_misses;              /* Estimated cache misses (from migrations) */
+	
+	/* Timing metrics */
+	u64 total_runtime;             /* Total accumulated runtime */
+	u64 total_sleep_time;          /* Total time spent sleeping */
+	u64 avg_runtime_per_slice;     /* Average runtime per scheduling slice */
+	u64 avg_sleep_duration;        /* Average sleep duration */
+	
+	/* GPU/Accelerator metrics */
+	u64 gpu_usage_count;           /* GPU operation count */
+	u64 last_gpu_access;           /* Last GPU access timestamp */
+	
+	/* Workload classification */
+	u32 confidence_scores[MAX_WORKLOAD_TYPES];  /* Confidence for each type */
+	u64 last_classification;       /* Last classification timestamp */
+	u64 classification_count;      /* Number of reclassifications */
+	
+	/* Performance monitoring state */
+	u8 perf_mon_state;             /* Current perf monitoring state */
+	u8 needs_detailed_analysis;    /* Flag for ambiguous classification */
+};
+
+/* Enhanced workload information */
 struct workload_info {
-	u32 workload_type;
-	u64 detection_time;
-	u64 gpu_usage_count;
-	u64 last_gpu_access;
-	u64 last_cpu_access;
-	u64 cpu_usage_time;
-	u64 io_operations;
-	u64 memory_allocations;
+	/* Current classification */
+	u32 current_type;              /* Current workload type */
+	u32 previous_type;             /* Previous workload type */
+	u32 type_confidence;           /* Confidence in current type (0-100) */
+	
+	/* Historical tracking */
+	u32 type_history[4];           /* Rolling history of types */
+	u8 history_index;              /* Current position in history */
+	
+	/* Classification metrics */
+	struct classification_metrics metrics;
+	
+	/* Performance event data (populated on-demand) */
+	struct perf_event_data perf_data;
+	
+	/* Policy hints for scheduler */
+	u8 prefer_big_core;            /* Hint to prefer performance cores */
+	u8 prefer_cache_local;         /* Hint to minimize cache migrations */
+	u8 latency_critical;           /* Hint for latency-critical handling */
 };
 
 #endif /* __INTF_H */

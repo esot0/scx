@@ -25,6 +25,18 @@ pub struct Metrics {
     pub nr_direct_dispatches: u64,
     #[stat(desc = "Number of regular task dispatches")]
     pub nr_shared_dispatches: u64,
+    #[stat(desc = "Unknown workload dispatches")]
+    pub nr_unknown_dispatches: u64,
+    #[stat(desc = "Latency-sensitive workload dispatches")]
+    pub nr_latency_dispatches: u64,
+    #[stat(desc = "CPU-intensive workload dispatches")]
+    pub nr_cpu_dispatches: u64,
+    #[stat(desc = "Cache-sensitive workload dispatches")]
+    pub nr_cache_dispatches: u64,
+    #[stat(desc = "GPU-intensive workload dispatches")]
+    pub nr_gpu_dispatches: u64,
+    #[stat(desc = "Mixed workload dispatches")]
+    pub nr_mixed_dispatches: u64,
 }
 
 impl Metrics {
@@ -39,6 +51,16 @@ impl Metrics {
             self.nr_direct_dispatches,
             self.nr_shared_dispatches
         )?;
+        writeln!(
+            w,
+            "workloads -> U: {:<5} L: {:<5} C: {:<5} $: {:<5} G: {:<5} M: {:<5}",
+            self.nr_unknown_dispatches,
+            self.nr_latency_dispatches,
+            self.nr_cpu_dispatches,
+            self.nr_cache_dispatches,
+            self.nr_gpu_dispatches,
+            self.nr_mixed_dispatches
+        )?;
         Ok(())
     }
 
@@ -47,6 +69,12 @@ impl Metrics {
             nr_kthread_dispatches: self.nr_kthread_dispatches - rhs.nr_kthread_dispatches,
             nr_direct_dispatches: self.nr_direct_dispatches - rhs.nr_direct_dispatches,
             nr_shared_dispatches: self.nr_shared_dispatches - rhs.nr_shared_dispatches,
+            nr_unknown_dispatches: self.nr_unknown_dispatches - rhs.nr_unknown_dispatches,
+            nr_latency_dispatches: self.nr_latency_dispatches - rhs.nr_latency_dispatches,
+            nr_cpu_dispatches: self.nr_cpu_dispatches - rhs.nr_cpu_dispatches,
+            nr_cache_dispatches: self.nr_cache_dispatches - rhs.nr_cache_dispatches,
+            nr_gpu_dispatches: self.nr_gpu_dispatches - rhs.nr_gpu_dispatches,
+            nr_mixed_dispatches: self.nr_mixed_dispatches - rhs.nr_mixed_dispatches,
             ..self.clone()
         }
     }
